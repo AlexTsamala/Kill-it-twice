@@ -1,6 +1,6 @@
 # SPEC.md — Kill It Twice
 
-**Version:** v1
+**Version:** v2
 **Date:** 2026-09-16
 **Author:** Aleksandre Tsamalashvili
 **Status:** Written before implementation. Expected to change — revisions are logged in §14.
@@ -40,8 +40,9 @@ PostgreSQL (source of truth)
                                     └───────────► RabbitMQ ──► Consumer ──► Projection table
 ```
 
-Both paths run **concurrently**. Failures anywhere are absorbed by checkpoints, bounded
-retries, and a DLQ. The whole thing is observable from a UI and provable by one command.
+Both paths run **concurrently**, and both write to **both sinks**. Failures anywhere are absorbed
+by checkpoints, bounded retries, and a DLQ. The whole thing is observable from a UI and provable
+by one command.
 
 **The primary deliverable is `make verify`.** Everything in this spec exists to make the five
 gates in §9 pass under a script, not under a demo I narrate by hand. Where a design choice
@@ -51,12 +52,11 @@ would produce a nicer system but a weaker gate, the gate wins.
 
 ## 2. Constraints I am working under
 
-| Constraint                                                                | Value                               |
-| ------------------------------------------------------------------------- | ----------------------------------- |
-| Calendar time                                                             | 9 days (2026-09-16 → 2026-09-25)    |
-| Team                                                                      | One engineer + coding agent         |
-| Runtime                                                                   | Single machine, `docker compose up` |
-| Reviewer environment . `make verify` must finish in **under 15 minutes**. |
+| Constraint    | Value                               |
+| ------------- | ----------------------------------- |
+| Calendar time | 9 days (2026-09-16 → 2026-09-25)    |
+| Team          | One engineer + coding agent         |
+| Runtime       | Single machine, `docker compose up` |
 
 The 15-minute budget is a real constraint, not a nicety. It caps the dataset size (§4), caps
 the sink-outage duration in G3, and rules out anything requiring a warm-up period.
@@ -123,7 +123,7 @@ The rule, stated precisely because §9/G4 depends on it:
 
 A whole-batch rollback because of 3 bad records out of 500 is a bug, not a safety measure.
 
-### D6 — Backfill and incremental run concurrently, not sequentially
+### D6 — Backfill and incremental run concurrently, and both write to both sinks
 
 Both workers start at the same time. There is no "backfill completes, then switch over" phase
 and no watermark handoff.
@@ -133,10 +133,28 @@ requires both modes running simultaneously, and it makes the long backfill a win
 live changes are only durable, not applied. D3's external versioning makes the concurrent design
 safe, so the sequenced version buys nothing.
 
-Backfill writes to **Elasticsearch only**. Incremental writes to **both sinks**. Rationale:
-backfill replays history that predates the pipeline; emitting 2M synthetic "created" events into
-the event stream would be a lie about when those things happened, and would make G2's counts
-ambiguous. This asymmetry is deliberate and the verify counts account for it.
+**Both workers write to both sinks.** Backfill publishes its rows to RabbitMQ with event type
+`product.snapshot`; incremental publishes `product.created` / `updated` / `deleted`. The
+distinct type keeps the semantics honest — a snapshot is current state, not something that just
+happened — while keeping the counts uniform: source, Elasticsearch, and the consumer projection
+must all reach 2,000,000, so G2 needs no footnote about why two sinks disagree.
+
+_Revised from v1_, where backfill wrote to Elasticsearch only. That version left the projection
+holding only the few thousand live changes, so G2's sink counts did not match and the gate
+needed a paragraph of explanation to read as a pass. A gate that needs explaining is a weak gate.
+
+Consequences, both accepted:
+
+- The consumer projection needs a version guard, since a backfill snapshot (version 4) and a
+  live update (version 7) for the same row can now arrive out of order:
+  `ON CONFLICT (id) DO UPDATE ... WHERE excluded.version > product_projection.version`.
+  This closed what was open question §13.1 in v1.
+- The consumer becomes the throughput bottleneck: 2M messages through one consumer with manual
+  ACKs is the slowest link in the chain. That is useful rather than unfortunate — it gives the
+  README's capacity notes a measured bottleneck and a concrete answer for doubling it (raise
+  prefetch and batch-commit the projection, or run N consumers on the same queue).
+- If this pushes `make verify` past the 15-minute budget in §2, `BACKFILL_PUBLISH_EVENTS` gates
+  the behaviour and the trade is recorded in the README rather than dropped silently.
 
 ### D7 — Batch size 500
 
@@ -175,11 +193,12 @@ Reasoning, since the brief grades it:
 - **Above the in-memory threshold.** 2M rows cannot be held in a Node heap, so keyset pagination
   and streaming are load-bearing rather than decorative. At 10k, an accidental
   `SELECT * FROM products` would pass every gate and hide the bug.
-- **A mid-run kill is meaningful.** Backfill runs ~4 minutes at the measured throughput, so
+- **A mid-run kill is meaningful.** Backfill runs several minutes at the measured throughput, so
   `docker kill` at t+90s lands genuinely mid-stream with a checkpoint that is neither 0 nor
   complete. At 10k the backfill finishes before the kill signal is delivered.
-- **Fits the 15-minute verify budget.** Backfill ~4 min, plus a 60s sink outage, plus the other
-  gates, leaves headroom on a cold laptop.
+- **Fits the 15-minute verify budget.** Backfill plus a 60s sink outage plus the other gates
+  leaves headroom on a cold laptop — though D6 makes the consumer the pacing item, so this is
+  the number most likely to be revised after the first measurement.
 - **Seeding is not the bottleneck.** `make seed` uses `COPY FROM STDIN` and generates 2M rows in
   well under a minute, so re-running verify is cheap.
 
@@ -251,7 +270,7 @@ CREATE TABLE processed_events (           -- consumer-side, D4
 
 CREATE TABLE product_projection (         -- consumer-side sink, countable by G2
     id      BIGINT PRIMARY KEY,
-    version INTEGER NOT NULL,
+    version INTEGER NOT NULL,             -- D6: guards against out-of-order snapshot vs update
     name    TEXT NOT NULL,
     price   NUMERIC(12,2) NOT NULL,
     status  TEXT NOT NULL
@@ -330,6 +349,10 @@ Event shape:
 `eventId` is derived from the outbox row ID, so it is stable across retries — which is what makes
 D4's dedup table work. A random UUID per publish attempt would defeat it.
 
+Backfill events carry `eventType: "product.snapshot"` and `eventId: "backfill-<productId>"`
+(D6). The prefix keeps backfill and incremental event IDs in separate namespaces, so a snapshot
+and a later update of the same row are two distinct events and neither dedups the other away.
+
 ---
 
 ## 8. Retry policy
@@ -369,9 +392,13 @@ Five scenarios. Each is executed by `make verify`, not described. Each prints on
 **Assertions:**
 
 - `SELECT count(*) FROM products WHERE deleted_at IS NULL` == ES doc count
-- == `count(*) FROM product_projection`
-- zero duplicate `aggregate_id` in the projection
+  == `count(*) FROM product_projection` — all three equal, per D6
+- zero duplicate `id` in the projection
+- `count(*) FROM processed_events` ≥ projection count, and the difference equals the number of
+  duplicate deliveries that were correctly suppressed rather than applied
 - declared guarantee printed alongside: at-least-once delivery, effectively-once application
+
+**PASS line:** `G2 no duplicates ... PASS (2,000,000 source / 2,000,000 es / 2,000,000 projection / 0 dupes)`
 
 ### G3 — Sink outage
 
@@ -406,7 +433,7 @@ Additionally: lag metric measurably rises during the G3 outage and returns after
 the metric is live rather than hardcoded.
 
 If a gate cannot be made to pass in the time available, it prints **FAIL** and the README explains
-why. A dishonest PASS is worse than an explained FAIL.
+why.
 
 ---
 
@@ -423,12 +450,16 @@ replication_lag_seconds
 replication_last_processed_id{pipeline}
 backfill_progress_ratio
 pipeline_throughput_per_second{pipeline}
+consumer_queue_depth
 sink_write_latency_ms{sink}          -- histogram
 ```
 
 `replication_lag_seconds` = `now() - occurred_at` of the **oldest unprocessed outbox row**, or 0
 when the outbox is drained. Defining it from the oldest unprocessed row rather than the newest
 processed one is what makes it spike correctly when the pipeline stalls.
+
+`consumer_queue_depth` exists because D6 makes the consumer the likely bottleneck; without it,
+a backlog there would be invisible from the UI.
 
 Structured JSON logs; every processing attempt carries `eventId`, `aggregateId`, `pipeline`,
 `attempt`, `outcome`, `error`.
@@ -443,7 +474,8 @@ shows as not-ready rather than silently healthy.
 React + Vite. Functional, not polished. Four screens, matching the four required functions:
 
 **1. Pipeline status** — backfill progress bar with cursor position and ETA, throughput sparkline,
-incremental lag in seconds, DLQ depth, per-dependency health lights. Polls `/admin/status` every 2s.
+incremental lag in seconds, consumer queue depth, DLQ depth, per-dependency health lights. Polls
+`/admin/status` every 2s.
 
 **2. Data browser** — paginated list of replicated records read **from Elasticsearch**, free-text
 search, detail view showing the ES document and its version. A live feed panel streams recent
@@ -464,15 +496,13 @@ endpoints back both the manual demo and the automated gates, so the gates exerci
 
 ## 12. Out of scope — and why
 
-| Cut                                           | Why                                                                                                                                        |
-| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| Debezium / logical replication CDC            | D1. 2–3 days for capability no gate tests.                                                                                                 |
-| Horizontal scaling, multi-worker coordination | Single worker is honest and provable. Concurrency would need advisory locks or partitioned cursors; documented as the first thing I'd add. |
-| Angular UI                                    | D8. Speed over stack-match, consciously.                                                                                                   |
-| Auth / multi-tenancy                          | Zero signal for the gates.                                                                                                                 |
-| S3, ClickHouse, NiFi                          | Present in Optio's stack, absent from the problem.                                                                                         |
-| Schema evolution / reindex-with-zero-downtime | The alias exists to make it possible; I am not implementing it.                                                                            |
-| Exactly-once                                  | D2. Would require distributed coordination I can neither build nor prove in 9 days.                                                        |
+| Horizontal scaling, multi-worker coordination | Single worker is honest and provable. Concurrency would need advisory locks or partitioned cursors; documented as the first thing I'd add.
+| Multiple parallel consumers | Named in D6 as the throughput fix, measured but not built. |
+| Angular UI | D8. Speed over stack-match, consciously. |
+| Auth / multi-tenancy | Zero signal for the gates. |
+| S3, ClickHouse, NiFi | Present in Optio's stack, absent from the problem. |
+| Schema evolution / reindex-with-zero-downtime | The alias exists to make it possible; I am not implementing it. |
+| Exactly-once | D2. Would require distributed coordination I can neither build nor prove in 9 days. |
 
 ---
 
@@ -480,25 +510,28 @@ endpoints back both the manual demo and the automated gates, so the gates exerci
 
 Not yet decided. The agent must ask rather than choose.
 
-1. **Does the consumer projection need to handle out-of-order events?** RabbitMQ preserves order
-   per queue, but a redelivery after NACK can arrive late. Leaning toward a `version >= existing`
-   guard in the projection upsert. Decide by day 4.
-2. **Should backfill throughput be deliberately throttled** so verify's kill timing is
+1. **Should backfill throughput be deliberately throttled** so verify's kill timing is
    deterministic across laptops, or left at full speed with the kill triggered by checkpoint
    position instead of wall clock? Position-triggered is more robust; costs a poll loop in the
    script.
-3. **DLQ replay for a record whose source row has since changed** — replay the stored payload, or
+2. **DLQ replay for a record whose source row has since changed** — replay the stored payload, or
    re-read current state? Stored payload is simpler and matches "replayable in isolation";
    re-reading is more useful operationally.
-4. **How many kill cycles does G2 need** to be convincing? Three is a guess.
+3. **How many kill cycles does G2 need** to be convincing? Three is a guess.
+4. **Does 2M survive the D6 change** within the 15-minute verify budget once the consumer is in
+   the path? Decide after the first end-to-end measurement; if not, either throttle the gates'
+   dataset or ship `BACKFILL_PUBLISH_EVENTS=false` with the trade documented.
+
+_(v1's open question on consumer out-of-order handling was closed by the D6 revision.)_
 
 ---
 
 ## 14. Revision log
 
-| Version | Date       | Change                                                |
-| ------- | ---------- | ----------------------------------------------------- |
-| v1      | 2026-09-16 | Initial spec, written before any implementation code. |
+| Version | Date | Change |
+
+| v1 | 2026-09-16 | Initial spec, written before any implementation code. |
+| v2 | 2026-09-16 | D6 revised: backfill now publishes to RabbitMQ as `product.snapshot` instead of writing to Elasticsearch only. v1's asymmetry left G2's sink counts mismatched and needing prose to explain. Knock-on changes: projection version guard (closes old §13.1), `consumer_queue_depth` metric, consumer named as expected bottleneck, new open question on the verify time budget. |
 
 Every later revision gets a row here plus a one-line reason. Revisions are committed separately
 from the code they describe.
