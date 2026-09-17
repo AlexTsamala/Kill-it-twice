@@ -50,6 +50,7 @@ These are in AGENTS.md too. They are repeated here because they are the ones tha
 - Questions in SPEC.md §13 are open. Ask; do not guess.
 - A commit touching SPEC.md contains only SPEC.md. Never amend or rebase its history.
 - Do not add dependencies without asking. Never add an ORM.
+- Do not touch README.md until day 8.
 
 ## Priority when time is short
 

@@ -1,0 +1,16 @@
+node_modules/
+dist/
+build/
+
+# Local environment — .env.example is committed, .env is not
+.env
+.env.local
+
+# Local agent settings and working notes
+.claude/settings.local.json
+PLAN.md
+
+# Logs and OS noise
+*.log
+npm-debug.log*
+.DS_Store
