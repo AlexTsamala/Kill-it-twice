@@ -59,7 +59,7 @@ applications or a monorepo with multiple package.json files.
 
 - **`migrations/` already committed.** Forward-only. Add `0007_*.sql`; never edit `0003_*.sql`.
 - **`SPEC.md`** — you may propose changes in `DEVLOG.md`; only the human edits the spec.
-- **`.env.example`** — add new variables here *and* document them, never rename existing ones.
+- **`.env.example`** — add new variables here _and_ document them, never rename existing ones.
 - **`verify.sh` gate assertions** — you may fix the script's mechanics (timing, polling, docker
   invocation). You may **not** loosen a threshold, widen a tolerance, or change an assertion so a
   failing gate passes. If a gate fails, the system is wrong, not the gate.
@@ -70,34 +70,110 @@ applications or a monorepo with multiple package.json files.
 
 ## 4. Conventions
 
-**Language:** TypeScript, strict mode. No `any` — use `unknown` and narrow. No non-null `!`.
+### Principles, briefly
 
-**Errors:** every error crossing a sink boundary is classified `transient | permanent` by an
-explicit function, never by string-matching at the call site. `src/common/errors.ts` owns that
-classification. Adding a new error case means editing that one file.
+- **KISS** — Always try to write simple and easy understandable code.
+- **YAGNI** — build what the spec asks for. No plugin systems, no strategy interfaces with
+  one implementation, no config for things that will never change.
+- **DRY, carefully** — extract on the _third_ occurrence, not the second. Two similar-looking
+  blocks that change for different reasons are not duplication. A wrong abstraction costs
+  more than a repeated line.
+- **Single responsibility** — a module has one reason to change. `elasticsearch.sink.ts`
+  writes to Elasticsearch; it does not decide what happens when the write fails.
+- **Dependency inversion where it earns its keep** — workers depend on a `Sink` interface, so
+  the simulation API can swap in a failing sink without touching worker code. Nowhere else.
 
-**Config:** environment variables only, validated at startup with a schema. The process must
-refuse to boot on invalid config rather than failing at first use. No hardcoded hosts, ports,
-credentials, batch sizes, or intervals — anywhere, including tests.
+### Rules that can be checked in a diff
 
-**Logging:** structured JSON via the shared logger. Never `console.log`. Every log line inside a
-processing path carries `eventId`, `aggregateId`, `pipeline`, `attempt`. Never log full payloads
-at info level.
+**Types.** TypeScript strict. No `any` — use `unknown` and narrow. No non-null `!`. No type
+assertions on external data: validate with zod at the boundary (HTTP body, ES response,
+RabbitMQ message, env) and work with typed values inward.
 
-**Database:** parameterised queries only. Anything that writes business data and an outbox row
-does both in one transaction — no exceptions, no "I'll add the transaction later".
+**Functions.** One job each. If you need "and" to describe what it does, split it. Over ~40
+lines, ask whether it is doing two things. Maximum 3 parameters — beyond that pass an object.
+No boolean parameters that switch behaviour (`process(batch, true)`): write two functions.
 
-**Async:** no floating promises. No `setInterval` for work loops; use a cancellable loop that
-honours shutdown. Every worker registers a SIGTERM handler that finishes the in-flight batch,
-persists the checkpoint, and exits cleanly — `docker kill` tests the ungraceful path, SIGTERM
-tests the graceful one, and both must be correct.
+**Nesting.** Maximum 3 levels. Use early returns and guard clauses rather than `else`:
 
-**Dependencies:** do not add a package without asking. `pg`, `@elastic/elasticsearch`, `amqplib`,
-`@nestjs/*`, `prom-client`, `zod`, `react`, `vite` are approved. Anything else needs a reason.
-Never add an ORM — the queries here are hand-written on purpose.
+```ts
+// no
+if (result.ok) { if (result.items) { for (...) { if (item.error) { ... } } } }
 
-**Naming:** metrics `snake_case` with unit suffix (`_total`, `_seconds`, `_ms`). Files
-`kebab-case.ts`. Classes `PascalCase`.
+// yes
+if (!result.ok) return;
+if (!result.items) return;
+for (const item of result.items) {
+  if (!item.error) continue;
+  ...
+}
+```
+
+**Naming.** Full words. `attemptCount` not `cnt`, `outboxRow` not `r`. Booleans read as
+predicates: `isRetryable`, `hasUnprocessedRows`. Functions are verbs: `classifyError`,
+`advanceCheckpoint`. Files `kebab-case.ts`. Classes `PascalCase`. Metrics `snake_case` with
+a unit suffix (`_total`, `_seconds`, `_ms`).
+
+**Module boundaries.** Dependencies point one direction:
+
+```
+common/  ←  sinks/  ←  replication/  ←  admin/
+```
+
+`common/` imports nothing from the app. Sinks know nothing about checkpoints, the outbox, or
+the DLQ — they write and report what happened. Decisions about retry, DLQ and checkpoints
+live in `replication/`, in one place, not scattered across sinks.
+
+**Errors.** Classified `transient | permanent` by one exported function in
+`src/common/errors.ts`, never by string-matching at the call site. Adding a new error case
+means editing that one file. Never catch and continue silently — log, DLQ, or rethrow.
+Never catch and rethrow with the cause lost.
+
+**Config.** Environment variables only, validated with a schema at startup. The process
+refuses to boot on invalid config rather than failing at first use. No hardcoded hosts,
+ports, credentials, batch sizes, intervals or timeouts anywhere — including tests.
+
+**Logging.** Structured JSON via the shared logger. Never `console.log`. Every line inside a
+processing path carries `eventId`, `aggregateId`, `pipeline`, `attempt`. Never log full
+payloads at info level.
+
+**Database.** Parameterised queries only. Hand-written SQL via `pg` for everything on the
+replication path — checkpoints, outbox, DLQ, projection upserts, keyset pagination, COPY.
+No query builder or ORM there: those queries are the correctness of the system and must be
+readable as SQL. A migration runner is fine.
+
+Anything that writes business data and an outbox row does both in one transaction. No
+exceptions, no "I will add the transaction later."
+
+**Async.** No floating promises. No `setInterval` for work loops — use a cancellable loop
+that honours shutdown. Every worker registers a SIGTERM handler that finishes the in-flight
+batch, persists the checkpoint, and exits cleanly. `docker kill` tests the ungraceful path;
+SIGTERM tests the graceful one. Both must be correct.
+
+**Comments.** Comment _why_, never _what_. `// increment attempts` above `attempts++` is
+noise that trains the reader to skip your comments, including the ones that matter. Write
+one only where the code is correct for a non-obvious reason — in this repo that is four
+places:
+
+1. the schema (`migrations/`) — why BIGSERIAL, why `version`, why soft deletes
+2. the checkpoint advance — why the DLQ insert and the checkpoint move share a transaction
+3. the `version_conflict_engine_exception` branch — why an exception is treated as success
+4. the projection upsert — why the `WHERE excluded.version > ...` guard exists
+
+Maximum 3 lines. Reference the decision, do not restate it: `(D3)` or `SPEC §5`. The
+rationale lives in SPEC.md; a copy here will go stale. No comments on CRUD, config or UI
+code. No commented-out code — delete it, git has it. A comment explaining a confusing
+function is a signal to rename the function instead.
+
+**Tests.** Unit tests for the failure paths: error classification, backoff calculation,
+checkpoint advance rules, DLQ routing, projection version guard. Write the failing test
+first for anything in that list — a retry test never observed failing proves nothing. Test
+behaviour, not implementation: assert that the checkpoint did not move, not that a mock was
+called twice. No mocking of Postgres, Elasticsearch or RabbitMQ in integration tests — use
+the compose stack.
+
+**Dependencies.** Do not add a package without asking. Approved: `pg`, `pg-copy-streams`,
+`@elastic/elasticsearch`, `amqplib`, `@nestjs/*`, `prom-client`, `zod`, `pino`, `react`,
+`vite`.
 
 ---
 

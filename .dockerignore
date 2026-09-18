@@ -1,0 +1,12 @@
+node_modules
+dist
+.git
+.github
+.claude
+.env
+.env.local
+*.log
+.DS_Store
+PLAN.md
+DEVLOG.md
+README.md
