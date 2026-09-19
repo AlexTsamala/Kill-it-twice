@@ -6,7 +6,7 @@ SHELL := /bin/bash
 	cp .env.example .env
 
 up: .env
-	docker compose up -d --wait
+	docker compose up -d --build --wait
 
 down:
 	docker compose down

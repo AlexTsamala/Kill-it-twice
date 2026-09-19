@@ -1,15 +1,17 @@
 {
   "compilerOptions": {
     "target": "es2023",
-    "lib": ["ES2023"],
+    "lib": [
+      "ES2023"
+    ],
     "module": "nodenext",
     "moduleResolution": "nodenext",
-    "types": ["node"],
-
+    "types": [
+      "node"
+    ],
     "rootDir": ".",
     "outDir": "dist",
     "sourceMap": true,
-
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
@@ -19,7 +21,12 @@
     "exactOptionalPropertyTypes": true,
     "verbatimModuleSyntax": true,
     "forceConsistentCasingInFileNames": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true
   },
-  "include": ["src/**/*.ts", "scripts/**/*.ts"]
+  "include": [
+    "src/**/*.ts",
+    "scripts/**/*.ts"
+  ]
 }

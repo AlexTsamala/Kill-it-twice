@@ -63,6 +63,21 @@ services:
       retries: 20
       start_period: 20s
 
+  worker:
+    build:
+      context: .
+    image: kill-it-twice:local
+    restart: on-failure
+    env_file:
+      - .env
+    environment:
+      APP_ROLE: worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+
   tools:
     build:
       context: .
