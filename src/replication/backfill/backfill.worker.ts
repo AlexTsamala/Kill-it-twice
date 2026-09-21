@@ -5,11 +5,14 @@ import { config } from '../../common/config.js';
 import { DATABASE, type Database } from '../../common/database.js';
 import { logger } from '../../common/logger.js';
 import { advanceCheckpoint, readCheckpoint, setPipelineStatus } from '../checkpoint.js';
+import { buildSnapshotEvent } from '../product-event.factory.js';
+import { EVENT_SINK, type EventSink } from '../sinks/event-sink.js';
 import {
   PRODUCT_SINK,
   type BulkItemFailure,
   type ProductDocument,
   type ProductSink,
+  indexOperation,
 } from '../sinks/product-sink.js';
 
 const PIPELINE = 'backfill';
@@ -69,7 +72,8 @@ export class BackfillWorker {
 
   constructor(
     @Inject(DATABASE) private readonly database: Database,
-    @Inject(PRODUCT_SINK) private readonly sink: ProductSink,
+    @Inject(PRODUCT_SINK) private readonly productSink: ProductSink,
+    @Inject(EVENT_SINK) private readonly eventSink: EventSink,
   ) {}
 
   requestStop(): void {
@@ -79,7 +83,10 @@ export class BackfillWorker {
   async run(): Promise<void> {
     let cursor = await readCheckpoint(this.database, PIPELINE);
     await setPipelineStatus(this.database, PIPELINE, 'running');
-    logger.info({ pipeline: PIPELINE, resumingFrom: cursor }, 'backfill started');
+    logger.info(
+      { pipeline: PIPELINE, resumingFrom: cursor, publishEvents: config.BACKFILL_PUBLISH_EVENTS },
+      'backfill started',
+    );
 
     const startedAt = Date.now();
     let applied = 0;
@@ -93,8 +100,12 @@ export class BackfillWorker {
         break;
       }
 
-      const result = await this.sink.writeBatch(documents);
+      const result = await this.productSink.writeBatch(documents.map(indexOperation));
       rejectBatchOnFailure(result.failures);
+
+      if (config.BACKFILL_PUBLISH_EVENTS) {
+        await this.eventSink.publishBatch(documents.map(buildSnapshotEvent));
+      }
 
       cursor = lastDocument.id;
       await advanceCheckpoint(this.database, PIPELINE, cursor);

@@ -67,7 +67,7 @@ services:
     build:
       context: .
     image: kill-it-twice:local
-    restart: on-failure
+    restart: unless-stopped
     env_file:
       - .env
     environment:
@@ -76,6 +76,23 @@ services:
       postgres:
         condition: service_healthy
       elasticsearch:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  consumer:
+    build:
+      context: .
+    image: kill-it-twice:local
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      APP_ROLE: consumer
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
 
   tools:

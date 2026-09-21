@@ -7,8 +7,8 @@ import { classifyResponseStatus } from '../../common/errors.js';
 import type {
   BulkItemFailure,
   BulkWriteResult,
-  ProductDocument,
   ProductSink,
+  SinkOperation,
 } from './product-sink.js';
 
 export const ELASTICSEARCH_CLIENT = Symbol('ElasticsearchClient');
@@ -46,13 +46,45 @@ export async function ensureProductsIndex(client: Client): Promise<void> {
   });
 }
 
+type BulkOperations = NonNullable<estypes.BulkRequest['operations']>;
+
+function toBulkOperations(operations: readonly SinkOperation[]): BulkOperations {
+  const bulk: BulkOperations = [];
+
+  for (const operation of operations) {
+    if (operation.kind === 'delete') {
+      bulk.push({
+        delete: {
+          _index: config.ELASTICSEARCH_INDEX,
+          _id: String(operation.id),
+          version: operation.version,
+          version_type: 'external',
+        },
+      });
+      continue;
+    }
+
+    bulk.push({
+      index: {
+        _index: config.ELASTICSEARCH_INDEX,
+        _id: String(operation.document.id),
+        version: operation.document.version,
+        version_type: 'external',
+      },
+    });
+    bulk.push(operation.document);
+  }
+
+  return bulk;
+}
+
 function summariseBulkResponse(response: estypes.BulkResponse): BulkWriteResult {
   let appliedCount = 0;
   let versionConflictCount = 0;
   const failures: BulkItemFailure[] = [];
 
   for (const item of response.items) {
-    const outcome = item.index;
+    const outcome = item.index ?? item.delete;
     if (outcome === undefined) {
       continue;
     }
@@ -83,24 +115,12 @@ function summariseBulkResponse(response: estypes.BulkResponse): BulkWriteResult 
 export class ElasticsearchProductSink implements ProductSink {
   constructor(@Inject(ELASTICSEARCH_CLIENT) private readonly client: Client) {}
 
-  async writeBatch(documents: readonly ProductDocument[]): Promise<BulkWriteResult> {
-    if (documents.length === 0) {
+  async writeBatch(operations: readonly SinkOperation[]): Promise<BulkWriteResult> {
+    if (operations.length === 0) {
       return { appliedCount: 0, versionConflictCount: 0, failures: [] };
     }
 
-    const operations = documents.flatMap((document) => [
-      {
-        index: {
-          _index: config.ELASTICSEARCH_INDEX,
-          _id: String(document.id),
-          version: document.version,
-          version_type: 'external' as const,
-        },
-      },
-      document,
-    ]);
-
-    const response = await this.client.bulk({ operations });
+    const response = await this.client.bulk({ operations: toBulkOperations(operations) });
     return summariseBulkResponse(response);
   }
 }

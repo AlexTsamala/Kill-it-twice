@@ -4,41 +4,68 @@ import { NestFactory } from '@nestjs/core';
 
 import { config } from './common/config.js';
 import { logger } from './common/logger.js';
+import { ConsumerModule } from './consumer/consumer.module.js';
+import { ProductConsumer } from './consumer/product.consumer.js';
 import { BackfillWorker } from './replication/backfill/backfill.worker.js';
+import { IncrementalWorker } from './replication/incremental/incremental.worker.js';
 import { ReplicationModule } from './replication/replication.module.js';
 
-async function runWorker(): Promise<void> {
-  const context = await NestFactory.createApplicationContext(ReplicationModule, {
-    logger: false,
-  });
-
-  const worker = context.get(BackfillWorker);
-
-  // Signals set a flag rather than tearing down: the loop must finish its in-flight batch
-  // and persist the checkpoint before Nest closes the pool (D5).
+function onShutdownSignal(stop: () => void): void {
   for (const signal of ['SIGTERM', 'SIGINT'] as const) {
     process.once(signal, () => {
-      logger.info({ signal }, 'shutdown requested; finishing in-flight batch');
-      worker.requestStop();
+      logger.info({ signal }, 'shutdown requested; finishing in-flight work');
+      stop();
     });
   }
+}
+
+async function runWorker(): Promise<void> {
+  const context = await NestFactory.createApplicationContext(ReplicationModule, { logger: false });
+  const backfill = context.get(BackfillWorker);
+  const incremental = context.get(IncrementalWorker);
+
+  onShutdownSignal(() => {
+    backfill.requestStop();
+    incremental.requestStop();
+  });
 
   try {
-    await worker.run();
+    // D6: no handoff and no sequencing — both pipelines race, and D3's external versioning
+    // is what makes that safe.
+    await Promise.all([backfill.run(), incremental.run()]);
   } finally {
     await context.close();
   }
 }
 
-async function main(): Promise<void> {
-  logger.info('starting');
+async function runConsumer(): Promise<void> {
+  const context = await NestFactory.createApplicationContext(ConsumerModule, { logger: false });
+  await context.get(ProductConsumer).start();
 
+  await new Promise<void>((resolve) => {
+    onShutdownSignal(resolve);
+  });
+
+  await context.close();
+}
+
+async function runRole(): Promise<void> {
   if (config.APP_ROLE === 'worker') {
     await runWorker();
     return;
   }
 
+  if (config.APP_ROLE === 'consumer') {
+    await runConsumer();
+    return;
+  }
+
   throw new Error(`APP_ROLE '${config.APP_ROLE}' is not implemented yet`);
+}
+
+async function main(): Promise<void> {
+  logger.info('starting');
+  await runRole();
 }
 
 try {

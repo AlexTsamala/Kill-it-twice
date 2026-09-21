@@ -7,6 +7,7 @@ const { Pool } = pg;
 export const DATABASE = Symbol('Database');
 
 export type Database = pg.Pool;
+export type DatabaseClient = pg.PoolClient;
 
 export function createDatabasePool(): Database {
   return new Pool({

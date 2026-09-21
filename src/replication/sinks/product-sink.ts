@@ -13,6 +13,10 @@ export interface ProductDocument {
   readonly updated_at: string;
 }
 
+export type SinkOperation =
+  | { readonly kind: 'index'; readonly document: ProductDocument }
+  | { readonly kind: 'delete'; readonly id: number; readonly version: number };
+
 export interface BulkItemFailure {
   readonly id: number;
   readonly errorClass: ErrorClass;
@@ -26,5 +30,13 @@ export interface BulkWriteResult {
 }
 
 export interface ProductSink {
-  writeBatch(documents: readonly ProductDocument[]): Promise<BulkWriteResult>;
+  writeBatch(operations: readonly SinkOperation[]): Promise<BulkWriteResult>;
+}
+
+export function indexOperation(document: ProductDocument): SinkOperation {
+  return { kind: 'index', document };
+}
+
+export function deleteOperation(id: number, version: number): SinkOperation {
+  return { kind: 'delete', id, version };
 }
