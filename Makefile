@@ -1,6 +1,9 @@
 SHELL := /bin/bash
 
-.PHONY: up down clean logs ps migrate seed build typecheck psql
+.PHONY: up down clean logs ps migrate seed build typecheck psql verify
+
+verify: .env
+	./verify.sh
 
 .env:
 	cp .env.example .env

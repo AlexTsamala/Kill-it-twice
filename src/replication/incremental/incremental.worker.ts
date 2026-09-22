@@ -5,7 +5,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { config } from '../../common/config.js';
 import { DATABASE, type Database } from '../../common/database.js';
 import { logger } from '../../common/logger.js';
-import type { RetryOptions } from '../../common/retry.js';
+import { type RetryOptions, waitAfterFailedRound } from '../../common/retry.js';
 import { writeBatchWithRetry } from '../batch-writer.js';
 import { readCheckpoint, setPipelineStatus } from '../checkpoint.js';
 import {
@@ -93,6 +93,7 @@ function toDeadLetterEntry(failure: BulkItemFailure, rows: readonly OutboxRow[])
 @Injectable()
 export class IncrementalWorker {
   #stopRequested = false;
+  #consecutiveFailures = 0;
   readonly #abort = new AbortController();
 
   constructor(
@@ -134,10 +135,15 @@ export class IncrementalWorker {
     }
 
     try {
-      return await this.#processBatch(rows, poisonIds);
+      const processed = await this.#processBatch(rows, poisonIds);
+      this.#consecutiveFailures = 0;
+      return processed;
     } catch (error) {
       await releasePoison(this.database, poisonIds);
-      return this.#reportBatchFailure(error);
+      this.#reportBatchFailure(error);
+      await waitAfterFailedRound(this.#consecutiveFailures, this.#retryOptions());
+      this.#consecutiveFailures += 1;
+      return 0;
     }
   }
 
@@ -188,16 +194,15 @@ export class IncrementalWorker {
     return survivors.length;
   }
 
-  #reportBatchFailure(error: unknown): number {
+  #reportBatchFailure(error: unknown): void {
     if (this.#stopRequested) {
-      return 0;
+      return;
     }
 
     logger.error(
-      { pipeline: PIPELINE, err: error },
+      { pipeline: PIPELINE, consecutiveFailures: this.#consecutiveFailures, err: error },
       'batch failed after retries; checkpoint held, will retry',
     );
-    return 0;
   }
 
   #retryOptions(): RetryOptions {

@@ -33,6 +33,26 @@ async function waitBeforeRetry(
   await delay(delayMs, undefined, { signal: options.signal });
 }
 
+/**
+ * Backs off between whole rounds too, not just between attempts inside one. Without it a
+ * round restarts the moment the previous one gave up, and a 60s outage costs ~36 attempts
+ * against G3's budget of 30.
+ */
+export async function waitAfterFailedRound(
+  consecutiveFailures: number,
+  options: RetryOptions,
+): Promise<void> {
+  try {
+    await delay(fullJitterDelayMs(consecutiveFailures, options.random), undefined, {
+      signal: options.signal,
+    });
+  } catch (error) {
+    if (!(error instanceof Error) || error.name !== 'AbortError') {
+      throw error;
+    }
+  }
+}
+
 export async function retryTransient<Result>(
   work: () => Promise<Result>,
   options: RetryOptions,

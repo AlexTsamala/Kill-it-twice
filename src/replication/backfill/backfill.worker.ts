@@ -1,12 +1,10 @@
-import { setTimeout as delay } from 'node:timers/promises';
-
 import { Inject, Injectable } from '@nestjs/common';
 import { z } from 'zod';
 
 import { config } from '../../common/config.js';
 import { DATABASE, type Database } from '../../common/database.js';
 import { logger } from '../../common/logger.js';
-import { type RetryOptions, backoffCeilingMs } from '../../common/retry.js';
+import { type RetryOptions, waitAfterFailedRound } from '../../common/retry.js';
 import { writeBatchWithRetry } from '../batch-writer.js';
 import { advanceCheckpoint, readCheckpoint, setPipelineStatus } from '../checkpoint.js';
 import { type DeadLetterEntry, deadLetterAndAdvanceCheckpoint } from '../dlq/dlq.repository.js';
@@ -22,7 +20,6 @@ import {
 
 const PIPELINE = 'backfill';
 const PROGRESS_EVERY_ROWS = 200_000;
-const RETRY_ROUND_DELAY_ATTEMPT = 1;
 const RETRY_SAME_CURSOR = 'retry-same-cursor';
 
 const productRowSchema = z.object({
@@ -85,6 +82,7 @@ function toDeadLetterEntry(
 @Injectable()
 export class BackfillWorker {
   #stopRequested = false;
+  #consecutiveFailures = 0;
   readonly #abort = new AbortController();
 
   constructor(
@@ -120,8 +118,10 @@ export class BackfillWorker {
 
       const counts = await this.#tryBatch(documents, cursor);
       if (counts === RETRY_SAME_CURSOR) {
+        this.#consecutiveFailures += 1;
         continue;
       }
+      this.#consecutiveFailures = 0;
 
       cursor = lastDocument.id;
       applied += counts.applied;
@@ -226,15 +226,7 @@ export class BackfillWorker {
   }
 
   async #waitBeforeRetryRound(): Promise<void> {
-    try {
-      await delay(backoffCeilingMs(RETRY_ROUND_DELAY_ATTEMPT), undefined, {
-        signal: this.#abort.signal,
-      });
-    } catch (error) {
-      if (!(error instanceof Error) || error.name !== 'AbortError') {
-        throw error;
-      }
-    }
+    await waitAfterFailedRound(this.#consecutiveFailures, this.#retryOptions());
   }
 
   #logProgress(progress: {
