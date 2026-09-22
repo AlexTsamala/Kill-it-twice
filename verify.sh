@@ -55,6 +55,8 @@ api_post() {
     -H 'content-type: application/json' -d "$body" 2>/dev/null
 }
 
+api_delete() { curl -sf -X DELETE "http://localhost:${HTTP_PORT}$1" 2>/dev/null; }
+
 es_count() {
   es "/${ELASTICSEARCH_INDEX}/_refresh" >/dev/null || true
   es "/${ELASTICSEARCH_INDEX}/_count" | jq -r '.count' 2>/dev/null || echo 0
@@ -296,6 +298,32 @@ gate_g4() {
     pass "G4 partial batch failure" "${applied} indexed / $poison dlq'd, checkpoint $checkpoint_before -> $checkpoint_after, replay ok"
   fi
   info "es before $es_before, after $(es_count) — poison never reached the index"
+
+  g4_clear_simulation_artifacts
+}
+
+# A replayed poison record is indexed and projected but has no source row, so it leaves
+# source == es == projection false until the simulation undoes itself.
+g4_clear_simulation_artifacts() {
+  local removed
+  removed=$(api_delete /admin/simulate/poison) || {
+    fail "G4 simulation cleanup" "the cleanup endpoint did not respond"
+    return
+  }
+
+  poll_until "projection to settle after cleanup" 60 \
+    '[ "$(projection_count)" -eq "$(source_count)" ]' || true
+
+  local src es_docs proj
+  src=$(source_count)
+  es_docs=$(es_count)
+  proj=$(projection_count)
+
+  if [ "$src" -ne "$es_docs" ] || [ "$src" -ne "$proj" ]; then
+    fail "G4 simulation cleanup" "source $src / es $es_docs / projection $proj still disagree"
+  else
+    pass "G4 simulation cleanup" "$(jq -rc '.' <<<"$removed"), counts back to $src"
+  fi
 }
 
 # Correct one DLQ payload and replay it. Returns non-zero unless the document lands.

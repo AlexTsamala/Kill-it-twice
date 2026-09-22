@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Inject, Post } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Inject, Post } from '@nestjs/common';
 import { z } from 'zod';
 
 import { DATABASE, type Database } from '../common/database.js';
@@ -9,6 +9,7 @@ import {
   readSinkStates,
   setSinkEnabled,
 } from '../replication/simulation/simulation.repository.js';
+import { PoisonCleanupService } from '../replication/simulation/poison-cleanup.service.js';
 import { parseBody } from './parse-body.js';
 import { SimulationService } from './simulation.service.js';
 
@@ -31,6 +32,7 @@ export class SimulationController {
   constructor(
     @Inject(DATABASE) private readonly database: Database,
     private readonly simulation: SimulationService,
+    private readonly poisonCleanup: PoisonCleanupService,
   ) {}
 
   @Get()
@@ -57,6 +59,11 @@ export class SimulationController {
     const ids = await injectPoisonRecords(this.database, request.count);
 
     return { injected: ids.length, ids };
+  }
+
+  @Delete('poison')
+  async clearPoison(): Promise<unknown> {
+    return this.poisonCleanup.removeAll();
   }
 
   @Post('mutations')

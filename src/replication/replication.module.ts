@@ -5,6 +5,7 @@ import { CommonModule } from '../common/common.module.js';
 import { BackfillWorker } from './backfill/backfill.worker.js';
 import { DlqService } from './dlq/dlq.service.js';
 import { IncrementalWorker } from './incremental/incremental.worker.js';
+import { PoisonCleanupService } from './simulation/poison-cleanup.service.js';
 import { SimulatedEventSink, SimulatedProductSink } from './simulation/simulated-sinks.js';
 import {
   ELASTICSEARCH_CLIENT,
@@ -34,11 +35,13 @@ import {
     BackfillWorker,
     IncrementalWorker,
     DlqService,
+    PoisonCleanupService,
   ],
   exports: [
     BackfillWorker,
     IncrementalWorker,
     DlqService,
+    PoisonCleanupService,
     RABBITMQ_CONNECTION,
     ELASTICSEARCH_CLIENT,
   ],
