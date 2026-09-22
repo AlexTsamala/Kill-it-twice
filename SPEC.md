@@ -1,6 +1,6 @@
 # SPEC.md — Kill It Twice
 
-**Version:** v2
+**Version:** v3
 **Date:** 2026-09-16
 **Author:** Aleksandre Tsamalashvili
 **Status:** Written before implementation. Expected to change — revisions are logged in §14.
@@ -182,6 +182,74 @@ One codebase, one Docker image, three roles selected by `APP_ROLE`:
 This matters for G1: `docker kill` targets the `worker` container specifically, and the API
 survives to report what happened.
 
+### D9 — verify kills by checkpoint position, not by wall clock
+
+`verify.sh` polls `replication_checkpoint` and fires `docker kill` once the backfill cursor
+crosses a threshold — 20%, 45% and 70% of the dataset. It never kills on a timer.
+
+_Rejected:_ throttling the backfill so a fixed `t+90s` lands mid-stream. A throttle is a knob
+that exists only to make the test work, and it would have to be retuned per machine. Position
+triggering costs a poll loop in the script and nothing in the system.
+
+The original "at t+90s" was stale by the first measurement: the backfill finishes in roughly
+145s here, and finished in 28s before D6 put RabbitMQ in the path. Any wall-clock number
+would have expired within a phase.
+
+Measured across five consecutive runs, the first kill landed between 402,500 and 421,000 —
+mid-stream every time, never at zero and never after completion.
+
+_Closes the first open question in v2's §13._
+
+### D10 — DLQ replay sends the stored payload, never a fresh read
+
+`POST /admin/dlq/:id/replay` re-sends `replication_dlq.payload` exactly as captured at failure
+time. Correcting a row is an explicit `PATCH` of that payload, not a re-read of the source.
+
+_Rejected:_ re-reading current state from `products`. It is more useful operationally, since
+the replay would pick up whatever fixed the row, but it makes a DLQ row mean something
+different depending on when it is replayed — the opposite of "replayable in isolation" (§5).
+
+It is also impossible for the failures G4 injects: a poison record was never in `products`,
+so there is no source row to re-read. A replay path that works for only some DLQ rows is
+worse than one rule that always holds.
+
+The stored payload keeps the field that caused the rejection. Storing a cleaned copy would
+make every replay succeed by accident and reduce G4's correct-then-replay assertion to
+theatre.
+
+_Closes the second open question in v2's §13._
+
+### D11 — G2 runs three kill/restart cycles
+
+Three, at 20%, 45% and 70% of the backfill.
+
+Every cycle exercises the same mechanism — resume from the persisted checkpoint — so extra
+cycles buy confidence rather than coverage. What three buys over one is three independent
+resume positions, including one after the pipeline has already recovered twice, which is
+where a checkpoint bug that only appears on re-resume would surface.
+
+Measured: fifteen kills across five consecutive runs, zero records lost, and source,
+Elasticsearch and the projection converging on 2,000,000 every time.
+
+Three remains a judgement rather than a proof. It is defensible because the failure it targets
+is deterministic once triggered, not probabilistic.
+
+_Closes the third open question in v2's §13._
+
+### D12 — 2,000,000 rows stay, and backfill keeps publishing events
+
+`make verify` runs all four gates from a cold start in 326–389s across five consecutive runs,
+against the 15-minute budget in §2 — roughly nine minutes spare.
+
+`BACKFILL_PUBLISH_EVENTS` stays `true`. The escape hatch D6 described is not needed, and the
+trade does not have to be documented as a cut.
+
+The consumer is the pacing item exactly as D6 predicted: the backfill publishes faster than
+the consumer acks, and `product.consumer` peaks near 925,000 messages before draining. That
+peak is the system's real capacity limit and is recorded in the README rather than hidden.
+
+_Closes the fourth open question in v2's §13._
+
 ---
 
 ## 4. Data volume — and why
@@ -321,8 +389,14 @@ classified into applied / version-conflict-skipped / transient / permanent, per 
 ## 7. RabbitMQ design
 
 Topic exchange `product.events` (durable) → queue `product.consumer` (durable, persistent
-messages) → consumer with manual ACK and prefetch 100. A second `analytics.queue` is bound but
-undrained, to demonstrate the fan-out is real.
+messages) → consumer with manual ACK and prefetch 100.
+
+_Removed in v3:_ a second `analytics.queue`, bound but undrained, to demonstrate the fan-out is
+real. It was undrained, so with D6 it accumulated every backfill snapshot — 2,000,000 messages
+held permanently — and eventually triggered RabbitMQ's resource alarm, which blocks publishers
+and stalled the backfill that was filling it. One consumer satisfies the requirement. Fan-out
+remains a property of the topic exchange; demonstrating it is one extra binding, and an
+undrained queue is a liability rather than a feature.
 
 Publisher confirms are **mandatory**. An un-confirmed publish is a failed publish; the outbox row
 is not marked processed until the broker confirms.
@@ -376,8 +450,12 @@ Five scenarios. Each is executed by `make verify`, not described. Each prints on
 
 ### G1 — Crash recovery
 
-**Setup:** start backfill over 2M rows; at t+90s, `docker kill` the `worker` container.
-**Restart:** compose restarts it.
+**Setup:** start backfill over 2M rows; `docker kill` the `worker` container once the backfill
+checkpoint crosses a position threshold (D9).
+**Restart:** `verify.sh` restarts it with `docker compose up -d worker`. Docker's restart
+policy does not cover `docker kill` — an explicit kill is treated as an intentional stop, so
+the container stays down with `RestartCount: 0`. The restart is the script's job, not the
+daemon's.
 **Assertions:**
 
 - resume cursor ≥ last persisted checkpoint and < total (proves it neither restarted nor finished)
@@ -496,7 +574,9 @@ endpoints back both the manual demo and the automated gates, so the gates exerci
 
 ## 12. Out of scope — and why
 
-| Horizontal scaling, multi-worker coordination | Single worker is honest and provable. Concurrency would need advisory locks or partitioned cursors; documented as the first thing I'd add.
+| Left out | Why |
+| --- | --- |
+| Horizontal scaling, multi-worker coordination | Single worker is honest and provable. Concurrency would need advisory locks or partitioned cursors; documented as the first thing I'd add. |
 | Multiple parallel consumers | Named in D6 as the throughput fix, measured but not built. |
 | Angular UI | D8. Speed over stack-match, consciously. |
 | Auth / multi-tenancy | Zero signal for the gates. |
@@ -508,30 +588,25 @@ endpoints back both the manual demo and the automated gates, so the gates exerci
 
 ## 13. Open questions
 
-Not yet decided. The agent must ask rather than choose.
+None.
 
-1. **Should backfill throughput be deliberately throttled** so verify's kill timing is
-   deterministic across laptops, or left at full speed with the kill triggered by checkpoint
-   position instead of wall clock? Position-triggered is more robust; costs a poll loop in the
-   script.
-2. **DLQ replay for a record whose source row has since changed** — replay the stored payload, or
-   re-read current state? Stored payload is simpler and matches "replayable in isolation";
-   re-reading is more useful operationally.
-3. **How many kill cycles does G2 need** to be convincing? Three is a guess.
-4. **Does 2M survive the D6 change** within the 15-minute verify budget once the consumer is in
-   the path? Decide after the first end-to-end measurement; if not, either throttle the gates'
-   dataset or ship `BACKFILL_PUBLISH_EVENTS=false` with the trade documented.
+Every question raised here in v1 and v2 is now closed, each after the measurement that
+answered it: kill timing (D9), DLQ replay (D10), G2's kill cycles (D11), and the dataset
+against the time budget (D12). v1's question on consumer out-of-order handling was closed by
+the D6 revision in v2.
 
-_(v1's open question on consumer out-of-order handling was closed by the D6 revision.)_
+A question is removed from this section only by becoming a decision in §3 with the evidence
+attached. Nothing was dropped for running out of time.
 
 ---
 
 ## 14. Revision log
 
 | Version | Date | Change |
-
+| --- | --- | --- |
 | v1 | 2026-09-16 | Initial spec, written before any implementation code. |
 | v2 | 2026-09-16 | D6 revised: backfill now publishes to RabbitMQ as `product.snapshot` instead of writing to Elasticsearch only. v1's asymmetry left G2's sink counts mismatched and needing prose to explain. Knock-on changes: projection version guard (closes old §13.1), `consumer_queue_depth` metric, consumer named as expected bottleneck, new open question on the verify time budget. |
+| v3 | 2026-09-22 | Removed `analytics.queue`. It was undrained, so with D6 it accumulated every backfill snapshot and would eventually trigger RabbitMQ's resource alarm and block publishers. One consumer satisfies the requirement. §13 closed and emptied, each question recorded as a decision with the measurement behind it: position-triggered kills (D9), stored-payload DLQ replay (D10), three kill cycles for G2 (D11), and 2,000,000 rows confirmed inside the time budget (D12). G1's setup corrected — "at t+90s" contradicted D9, and "compose restarts it" was false, since `docker kill` does not trigger Docker's restart policy. Malformed tables in §12 and §14 fixed; neither rendered on GitHub. |
 
 Every later revision gets a row here plus a one-line reason. Revisions are committed separately
 from the code they describe.
