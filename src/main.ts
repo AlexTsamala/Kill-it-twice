@@ -2,6 +2,7 @@ import 'reflect-metadata';
 
 import { NestFactory } from '@nestjs/core';
 
+import { AdminModule } from './admin/admin.module.js';
 import { config } from './common/config.js';
 import { logger } from './common/logger.js';
 import { ConsumerModule } from './consumer/consumer.module.js';
@@ -30,8 +31,6 @@ async function runWorker(): Promise<void> {
   });
 
   try {
-    // D6: no handoff and no sequencing — both pipelines race, and D3's external versioning
-    // is what makes that safe.
     await Promise.all([backfill.run(), incremental.run()]);
   } finally {
     await context.close();
@@ -49,6 +48,19 @@ async function runConsumer(): Promise<void> {
   await context.close();
 }
 
+async function runApi(): Promise<void> {
+  const app = await NestFactory.create(AdminModule, { logger: false });
+  app.enableShutdownHooks();
+  await app.listen(config.HTTP_PORT);
+  logger.info({ port: config.HTTP_PORT }, 'admin api listening');
+
+  await new Promise<void>((resolve) => {
+    onShutdownSignal(resolve);
+  });
+
+  await app.close();
+}
+
 async function runRole(): Promise<void> {
   if (config.APP_ROLE === 'worker') {
     await runWorker();
@@ -60,7 +72,7 @@ async function runRole(): Promise<void> {
     return;
   }
 
-  throw new Error(`APP_ROLE '${config.APP_ROLE}' is not implemented yet`);
+  await runApi();
 }
 
 async function main(): Promise<void> {

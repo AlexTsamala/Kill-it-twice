@@ -3,7 +3,9 @@ import type { Client } from '@elastic/elasticsearch';
 
 import { CommonModule } from '../common/common.module.js';
 import { BackfillWorker } from './backfill/backfill.worker.js';
+import { DlqService } from './dlq/dlq.service.js';
 import { IncrementalWorker } from './incremental/incremental.worker.js';
+import { SimulatedEventSink, SimulatedProductSink } from './simulation/simulated-sinks.js';
 import {
   ELASTICSEARCH_CLIENT,
   ElasticsearchProductSink,
@@ -23,12 +25,23 @@ import {
   providers: [
     { provide: ELASTICSEARCH_CLIENT, useFactory: createElasticsearchClient },
     { provide: RABBITMQ_CONNECTION, useFactory: createRabbitmqConnection },
-    { provide: PRODUCT_SINK, useClass: ElasticsearchProductSink },
-    { provide: EVENT_SINK, useClass: RabbitmqEventSink },
+    ElasticsearchProductSink,
+    RabbitmqEventSink,
+    // The simulation decorators are the only bindings the workers see, so switching a sink
+    // off from the admin API exercises the real retry path rather than a test-only branch.
+    { provide: PRODUCT_SINK, useClass: SimulatedProductSink },
+    { provide: EVENT_SINK, useClass: SimulatedEventSink },
     BackfillWorker,
     IncrementalWorker,
+    DlqService,
   ],
-  exports: [BackfillWorker, IncrementalWorker, RABBITMQ_CONNECTION],
+  exports: [
+    BackfillWorker,
+    IncrementalWorker,
+    DlqService,
+    RABBITMQ_CONNECTION,
+    ELASTICSEARCH_CLIENT,
+  ],
 })
 export class ReplicationModule implements OnApplicationShutdown {
   constructor(

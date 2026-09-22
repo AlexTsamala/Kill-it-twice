@@ -1,0 +1,52 @@
+import { setTimeout as delay } from 'node:timers/promises';
+
+import { config } from './config.js';
+import { classifyThrownError } from './errors.js';
+import { logger } from './logger.js';
+
+export interface RetryOptions {
+  readonly pipeline: string;
+  readonly signal: AbortSignal;
+  readonly random: () => number;
+}
+
+export function backoffCeilingMs(attempt: number): number {
+  return Math.min(config.RETRY_CAP_MS, config.RETRY_BASE_MS * 2 ** attempt);
+}
+
+export function fullJitterDelayMs(attempt: number, random: () => number): number {
+  return Math.floor(random() * backoffCeilingMs(attempt));
+}
+
+async function waitBeforeRetry(
+  attempt: number,
+  error: unknown,
+  options: RetryOptions,
+): Promise<void> {
+  const delayMs = fullJitterDelayMs(attempt, options.random);
+
+  logger.warn(
+    { pipeline: options.pipeline, attempt: attempt + 1, delayMs, err: error },
+    'transient failure; retrying',
+  );
+
+  await delay(delayMs, undefined, { signal: options.signal });
+}
+
+export async function retryTransient<Result>(
+  work: () => Promise<Result>,
+  options: RetryOptions,
+): Promise<Result> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await work();
+    } catch (error) {
+      const isLastAttempt = attempt + 1 >= config.RETRY_MAX_ATTEMPTS;
+      if (isLastAttempt || classifyThrownError(error) === 'permanent') {
+        throw error;
+      }
+
+      await waitBeforeRetry(attempt, error, options);
+    }
+  }
+}

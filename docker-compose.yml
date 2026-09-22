@@ -63,6 +63,35 @@ services:
       retries: 20
       start_period: 20s
 
+  api:
+    build:
+      context: .
+    image: kill-it-twice:local
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      APP_ROLE: api
+    ports:
+      - "${HTTP_PORT}:${HTTP_PORT}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          node -e "fetch('http://localhost:'+process.env.HTTP_PORT+'/health')
+          .then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
   worker:
     build:
       context: .

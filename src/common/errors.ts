@@ -20,7 +20,25 @@ const TRANSIENT_ERROR_NAMES = new Set([
   'ConnectionError',
   'TimeoutError',
   'NoLivingConnectionsError',
+  'SinkDisabledError',
+  'TransientBatchError',
 ]);
+
+/** Raised so per-item transient rejections take the same backoff as a sink that is down. */
+export class TransientBatchError extends Error {
+  constructor(transientCount: number) {
+    super(`${String(transientCount)} item(s) transiently rejected; retrying the batch`);
+    this.name = 'TransientBatchError';
+  }
+}
+
+/** Transient on purpose: a sink switched off behaves like a sink that is down. */
+export class SinkDisabledError extends Error {
+  constructor(sink: string) {
+    super(`${sink} sink is disabled by the simulation API`);
+    this.name = 'SinkDisabledError';
+  }
+}
 
 const statusCarrierSchema = z.object({ statusCode: z.number().int() });
 const codeCarrierSchema = z.object({ code: z.string() });

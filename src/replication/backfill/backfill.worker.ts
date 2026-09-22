@@ -1,10 +1,15 @@
+import { setTimeout as delay } from 'node:timers/promises';
+
 import { Inject, Injectable } from '@nestjs/common';
 import { z } from 'zod';
 
 import { config } from '../../common/config.js';
 import { DATABASE, type Database } from '../../common/database.js';
 import { logger } from '../../common/logger.js';
+import { type RetryOptions, backoffCeilingMs } from '../../common/retry.js';
+import { writeBatchWithRetry } from '../batch-writer.js';
 import { advanceCheckpoint, readCheckpoint, setPipelineStatus } from '../checkpoint.js';
+import { type DeadLetterEntry, deadLetterAndAdvanceCheckpoint } from '../dlq/dlq.repository.js';
 import { buildSnapshotEvent } from '../product-event.factory.js';
 import { EVENT_SINK, type EventSink } from '../sinks/event-sink.js';
 import {
@@ -17,6 +22,8 @@ import {
 
 const PIPELINE = 'backfill';
 const PROGRESS_EVERY_ROWS = 200_000;
+const RETRY_ROUND_DELAY_ATTEMPT = 1;
+const RETRY_SAME_CURSOR = 'retry-same-cursor';
 
 const productRowSchema = z.object({
   id: z.coerce.number().int().positive(),
@@ -28,6 +35,11 @@ const productRowSchema = z.object({
   version: z.number().int(),
   updated_at: z.date(),
 });
+
+interface BatchCounts {
+  readonly applied: number;
+  readonly versionConflicts: number;
+}
 
 function toProductDocument(row: unknown): ProductDocument {
   const parsed = productRowSchema.parse(row);
@@ -43,32 +55,37 @@ function toProductDocument(row: unknown): ProductDocument {
   };
 }
 
-function rejectBatchOnFailure(failures: readonly BulkItemFailure[]): void {
-  if (failures.length === 0) {
-    return;
-  }
+function unknownDocument(id: number): ProductDocument {
+  return {
+    id,
+    sku: `UNKNOWN-${String(id)}`,
+    name: 'unknown',
+    description: null,
+    price: 0,
+    status: 'unknown',
+    version: 1,
+    updated_at: new Date().toISOString(),
+  };
+}
 
-  for (const failure of failures) {
-    logger.error(
-      {
-        pipeline: PIPELINE,
-        aggregateId: failure.id,
-        errorClass: failure.errorClass,
-        reason: failure.reason,
-      },
-      'bulk item rejected',
-    );
-  }
-
-  throw new Error(
-    `${String(failures.length)} item(s) rejected by Elasticsearch and there is no DLQ yet ` +
-      `(Phase 4). The checkpoint has not advanced, so the batch is retried on restart.`,
-  );
+function toDeadLetterEntry(
+  failure: BulkItemFailure,
+  documents: readonly ProductDocument[],
+): DeadLetterEntry {
+  return {
+    sourceRef: failure.id,
+    aggregateId: failure.id,
+    eventType: 'product.snapshot',
+    payload: documents[failure.position] ?? unknownDocument(failure.id),
+    error: failure.reason,
+    attempts: config.RETRY_MAX_ATTEMPTS,
+  };
 }
 
 @Injectable()
 export class BackfillWorker {
   #stopRequested = false;
+  readonly #abort = new AbortController();
 
   constructor(
     @Inject(DATABASE) private readonly database: Database,
@@ -78,6 +95,7 @@ export class BackfillWorker {
 
   requestStop(): void {
     this.#stopRequested = true;
+    this.#abort.abort();
   }
 
   async run(): Promise<void> {
@@ -100,18 +118,14 @@ export class BackfillWorker {
         break;
       }
 
-      const result = await this.productSink.writeBatch(documents.map(indexOperation));
-      rejectBatchOnFailure(result.failures);
-
-      if (config.BACKFILL_PUBLISH_EVENTS) {
-        await this.eventSink.publishBatch(documents.map(buildSnapshotEvent));
+      const counts = await this.#tryBatch(documents, cursor);
+      if (counts === RETRY_SAME_CURSOR) {
+        continue;
       }
 
       cursor = lastDocument.id;
-      await advanceCheckpoint(this.database, PIPELINE, cursor);
-
-      applied += result.appliedCount;
-      versionConflicts += result.versionConflictCount;
+      applied += counts.applied;
+      versionConflicts += counts.versionConflicts;
 
       if (applied + versionConflicts >= nextProgressAt) {
         this.#logProgress({ cursor, applied, versionConflicts, startedAt });
@@ -134,6 +148,66 @@ export class BackfillWorker {
     );
   }
 
+  async #tryBatch(
+    documents: readonly ProductDocument[],
+    cursor: number,
+  ): Promise<BatchCounts | typeof RETRY_SAME_CURSOR> {
+    try {
+      return await this.#processBatch(documents, cursor);
+    } catch (error) {
+      if (this.#stopRequested) {
+        return RETRY_SAME_CURSOR;
+      }
+
+      logger.error(
+        { pipeline: PIPELINE, cursor, err: error },
+        'batch failed after retries; checkpoint held, will retry',
+      );
+      await this.#waitBeforeRetryRound();
+      return RETRY_SAME_CURSOR;
+    }
+  }
+
+  async #processBatch(documents: readonly ProductDocument[], cursor: number): Promise<BatchCounts> {
+    const result = await writeBatchWithRetry(
+      this.productSink,
+      documents.map(indexOperation),
+      this.#retryOptions(),
+    );
+
+    const advanceTo = documents.at(-1)?.id ?? cursor;
+    const failedPositions = new Set(result.failures.map((failure) => failure.position));
+    const survivors = documents.filter((_, position) => !failedPositions.has(position));
+
+    if (config.BACKFILL_PUBLISH_EVENTS) {
+      await this.eventSink.publishBatch(survivors.map(buildSnapshotEvent));
+    }
+
+    const counts = {
+      applied: result.appliedCount,
+      versionConflicts: result.versionConflictCount,
+    };
+
+    if (result.failures.length === 0) {
+      await advanceCheckpoint(this.database, PIPELINE, advanceTo);
+      return counts;
+    }
+
+    await deadLetterAndAdvanceCheckpoint(this.database, {
+      pipeline: PIPELINE,
+      entries: result.failures.map((failure) => toDeadLetterEntry(failure, documents)),
+      checkpointAt: cursor,
+      advanceTo,
+      processedOutboxIds: [],
+    });
+
+    logger.warn(
+      { pipeline: PIPELINE, cursor, deadLettered: result.failures.length },
+      'batch partially dead-lettered',
+    );
+    return counts;
+  }
+
   async #fetchNextBatch(afterId: number): Promise<ProductDocument[]> {
     const { rows } = await this.database.query<Record<string, unknown>>(
       `SELECT id, sku, name, description, price, status, version, updated_at
@@ -145,6 +219,22 @@ export class BackfillWorker {
     );
 
     return rows.map(toProductDocument);
+  }
+
+  #retryOptions(): RetryOptions {
+    return { pipeline: PIPELINE, signal: this.#abort.signal, random: Math.random };
+  }
+
+  async #waitBeforeRetryRound(): Promise<void> {
+    try {
+      await delay(backoffCeilingMs(RETRY_ROUND_DELAY_ATTEMPT), undefined, {
+        signal: this.#abort.signal,
+      });
+    } catch (error) {
+      if (!(error instanceof Error) || error.name !== 'AbortError') {
+        throw error;
+      }
+    }
   }
 
   #logProgress(progress: {

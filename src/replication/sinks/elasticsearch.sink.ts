@@ -1,14 +1,16 @@
 import { Client } from '@elastic/elasticsearch';
 import type { estypes } from '@elastic/elasticsearch';
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, type OnModuleInit } from '@nestjs/common';
 
 import { config } from '../../common/config.js';
 import { classifyResponseStatus } from '../../common/errors.js';
-import type {
-  BulkItemFailure,
-  BulkWriteResult,
-  ProductSink,
-  SinkOperation,
+import { logger } from '../../common/logger.js';
+import {
+  type BulkItemFailure,
+  type BulkWriteResult,
+  type ProductSink,
+  type SinkOperation,
+  poisonDocumentBody,
 } from './product-sink.js';
 
 export const ELASTICSEARCH_CLIENT = Symbol('ElasticsearchClient');
@@ -52,6 +54,12 @@ function toBulkOperations(operations: readonly SinkOperation[]): BulkOperations 
   const bulk: BulkOperations = [];
 
   for (const operation of operations) {
+    if (operation.kind === 'poison') {
+      bulk.push({ index: { _index: config.ELASTICSEARCH_INDEX, _id: String(operation.id) } });
+      bulk.push(poisonDocumentBody(operation.id));
+      continue;
+    }
+
     if (operation.kind === 'delete') {
       bulk.push({
         delete: {
@@ -83,7 +91,7 @@ function summariseBulkResponse(response: estypes.BulkResponse): BulkWriteResult 
   let versionConflictCount = 0;
   const failures: BulkItemFailure[] = [];
 
-  for (const item of response.items) {
+  for (const [position, item] of response.items.entries()) {
     const outcome = item.index ?? item.delete;
     if (outcome === undefined) {
       continue;
@@ -94,14 +102,13 @@ function summariseBulkResponse(response: estypes.BulkResponse): BulkWriteResult 
       continue;
     }
 
-    // D3: Elasticsearch already holds a newer version, so the write is redundant rather
-    // than failed. Counting this as an error is the single most likely bug here.
     if (outcome.error.type === VERSION_CONFLICT) {
       versionConflictCount += 1;
       continue;
     }
 
     failures.push({
+      position,
       id: Number(outcome._id),
       errorClass: classifyResponseStatus(outcome.status),
       reason: outcome.error.reason ?? outcome.error.type,
@@ -112,8 +119,13 @@ function summariseBulkResponse(response: estypes.BulkResponse): BulkWriteResult 
 }
 
 @Injectable()
-export class ElasticsearchProductSink implements ProductSink {
+export class ElasticsearchProductSink implements ProductSink, OnModuleInit {
   constructor(@Inject(ELASTICSEARCH_CLIENT) private readonly client: Client) {}
+
+  async onModuleInit(): Promise<void> {
+    await ensureProductsIndex(this.client);
+    logger.info({ index: config.ELASTICSEARCH_INDEX }, 'elasticsearch index ready');
+  }
 
   async writeBatch(operations: readonly SinkOperation[]): Promise<BulkWriteResult> {
     if (operations.length === 0) {
