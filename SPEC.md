@@ -1,6 +1,6 @@
 # SPEC.md — Kill It Twice
 
-**Version:** v3
+**Version:** v4
 **Date:** 2026-09-16
 **Author:** Aleksandre Tsamalashvili
 **Status:** Written before implementation. Expected to change — revisions are logged in §14.
@@ -254,19 +254,25 @@ _Closes the fourth open question in v2's §13._
 
 ## 4. Data volume — and why
 
-**2,000,000 products**, roughly 400–600 bytes each, ~1.2 GB in Postgres.
+**2,000,000 products.** Measured at 526 MB in Postgres — 423 MB of heap plus 103 MB of
+indexes, about 276 bytes per row all-in.
+
+_Corrected in v4._ The estimate written before implementation was 400–600 bytes per row and
+~1.2 GB, roughly double the truth. The generated rows are narrower than guessed, and nothing
+below depended on the size being 1.2 GB — the reasoning is about row count, not bytes.
 
 Reasoning, since the brief grades it:
 
 - **Above the in-memory threshold.** 2M rows cannot be held in a Node heap, so keyset pagination
   and streaming are load-bearing rather than decorative. At 10k, an accidental
   `SELECT * FROM products` would pass every gate and hide the bug.
-- **A mid-run kill is meaningful.** Backfill runs several minutes at the measured throughput, so
-  `docker kill` at t+90s lands genuinely mid-stream with a checkpoint that is neither 0 nor
-  complete. At 10k the backfill finishes before the kill signal is delivered.
-- **Fits the 15-minute verify budget.** Backfill plus a 60s sink outage plus the other gates
-  leaves headroom on a cold laptop — though D6 makes the consumer the pacing item, so this is
-  the number most likely to be revised after the first measurement.
+- **A mid-run kill is meaningful.** The backfill runs about 145s, so a kill triggered on
+  checkpoint position (D9) lands genuinely mid-stream with a cursor that is neither 0 nor
+  complete — measured between 402,500 and 421,000 across five runs. At 10k the backfill would
+  finish before the kill signal was delivered.
+- **Fits the 15-minute verify budget.** Measured: all four gates from cold in 326–389s,
+  including the 60s sink outage (D12). D6 made the consumer the pacing item exactly as
+  expected, and it still leaves roughly nine minutes spare.
 - **Seeding is not the bottleneck.** `make seed` uses `COPY FROM STDIN` and generates 2M rows in
   well under a minute, so re-running verify is cheap.
 
@@ -607,6 +613,7 @@ attached. Nothing was dropped for running out of time.
 | v1 | 2026-09-16 | Initial spec, written before any implementation code. |
 | v2 | 2026-09-16 | D6 revised: backfill now publishes to RabbitMQ as `product.snapshot` instead of writing to Elasticsearch only. v1's asymmetry left G2's sink counts mismatched and needing prose to explain. Knock-on changes: projection version guard (closes old §13.1), `consumer_queue_depth` metric, consumer named as expected bottleneck, new open question on the verify time budget. |
 | v3 | 2026-09-22 | Removed `analytics.queue`. It was undrained, so with D6 it accumulated every backfill snapshot and would eventually trigger RabbitMQ's resource alarm and block publishers. One consumer satisfies the requirement. §13 closed and emptied, each question recorded as a decision with the measurement behind it: position-triggered kills (D9), stored-payload DLQ replay (D10), three kill cycles for G2 (D11), and 2,000,000 rows confirmed inside the time budget (D12). G1's setup corrected — "at t+90s" contradicted D9, and "compose restarts it" was false, since `docker kill` does not trigger Docker's restart policy. Malformed tables in §12 and §14 fixed; neither rendered on GitHub. |
+| v4 | 2026-09-22 | §4's size corrected: measured 526 MB and ~276 bytes per row, against the pre-implementation estimate of ~1.2 GB and 400–600 bytes — roughly double the truth. The reasoning in §4 rests on row count rather than bytes, so it stands unchanged. Its two stale bullets also updated: the kill is position-triggered per D9, not at t+90s, and the time budget is now measured rather than predicted per D12. |
 
 Every later revision gets a row here plus a one-line reason. Revisions are committed separately
 from the code they describe.
