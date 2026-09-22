@@ -1,3 +1,5 @@
+import { logger } from '../common/logger.js';
+
 /**
  * Serialises work per aggregate id while leaving different aggregates concurrent.
  *
@@ -15,12 +17,17 @@ export class AggregateSerializer {
 
   run(aggregateId: number, work: () => Promise<void>): void {
     const previous = this.#chains.get(aggregateId) ?? Promise.resolve();
-    const next = previous.then(work);
 
-    this.#chains.set(aggregateId, next);
+    // A rejection here would reach the process as an unhandled rejection and take the
+    // consumer down with it, and every later event for this aggregate would be skipped.
+    const link = previous.then(work).catch((error: unknown) => {
+      logger.error({ aggregateId, err: error }, 'handler escaped its own error handling');
+    });
 
-    void next.finally(() => {
-      if (this.#chains.get(aggregateId) === next) {
+    this.#chains.set(aggregateId, link);
+
+    void link.finally(() => {
+      if (this.#chains.get(aggregateId) === link) {
         this.#chains.delete(aggregateId);
       }
     });
