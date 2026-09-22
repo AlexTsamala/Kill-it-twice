@@ -22,7 +22,6 @@ const schema = z.object({
   RABBITMQ_URL: z.string().min(1),
   RABBITMQ_EXCHANGE: z.string().min(1),
   RABBITMQ_QUEUE: z.string().min(1),
-  RABBITMQ_ANALYTICS_QUEUE: z.string().min(1),
   RABBITMQ_PREFETCH: positiveInt,
 
   BATCH_SIZE: positiveInt,

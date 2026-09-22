@@ -113,3 +113,71 @@ cluster afterwards: `dynamic: strict`, `price` as `scaled_float` with `scaling_f
 
 **Still open:** the same class of gap applies to anything else asserted only by a row count.
 Phase 5's `verify.sh` should assert the mapping itself, not only the document total.
+
+---
+
+## 2026-09-22 — the fan-out queue blocked the pipeline that fills it
+
+**Asked for:** Phase 5 — `verify.sh` passing G1..G4 across five consecutive clean runs.
+"Flaky is failing. If it passes 4 times out of 5, it does not pass."
+
+**What happened:** runs 1 to 4 passed in 326–371s. Run 5 failed G1/G2 and G3 and took 887s.
+The backfill had not stopped; it had slowed to roughly 108 rows per second against a normal
+14,000. After the second kill/restart it moved 86,000 rows in 792 seconds and never reached
+the third kill threshold, so the cycle timed out and everything after it read a half-populated
+index.
+
+**Why it was wrong:** RabbitMQ's log dated the window exactly — `system_memory_high_watermark`
+set at 11:57:08 and cleared at 12:10:00, against a stall from 11:57:34 to 12:10:46. A memory
+alarm blocks publishing connections, so `channel.publish` returned false and the backfill sat
+in `waitForDrainOrThrow` waiting for a drain event that could not arrive until the alarm
+cleared.
+
+The cause is `analytics.queue`. SPEC §7 binds it to demonstrate that the fan-out is real and
+deliberately never drains it, so a 2,000,000-row backfill leaves 2,000,000 messages in it
+permanently — on top of whatever `product.consumer` has not yet acked. The default watermark
+is 40% of system memory. The demonstration queue was competing for memory with the pipeline
+it exists to demonstrate.
+
+It passed four times because the consumer usually kept its own queue short enough to stay
+under the limit. Run 5's kill cycles shifted the timing and pushed it over. That is the worst
+kind of failure to find late: a real capacity limit wearing the costume of a flaky test, and
+it would have hit a reviewer with less RAM on the first run rather than the fifth.
+
+**Resolution:** `analytics.queue` is removed, and SPEC §7 is amended in its own commit (v3).
+
+The first fix was `x-queue-mode: lazy`, which keeps the queue's messages on disk. It works,
+but it treats the symptom: the queue would still be accumulating 2,000,000 messages that
+nothing will ever read. Measured peaks made the trade obvious —
+
+| queue | peak depth | drained? |
+| --- | --- | --- |
+| `analytics.queue` | 2,001,000 | never |
+| `product.consumer` | 925,405 | yes, continuously |
+
+Two thirds of the broker's load existed only to illustrate that a topic exchange fans out.
+`PLAN.md` already listed the second queue as the first thing to cut after UI polish, so the
+cut was planned; the alarm only supplied the reason. Nothing in G1..G4 referenced it.
+
+**What this does not fix:** `product.consumer` still peaks near 925,000 messages, because the
+backfill publishes faster than the consumer acks — the bottleneck D6 predicted. The alarm
+still fires at that peak. What changed is that it no longer blocks: in the five runs after
+the removal the backfill went straight through an alarm window at full speed —
+
+```
+12:54:26  alarm set
+12:54:34  cursor   822,500   200,000 rows in 10s
+12:54:54  cursor 1,124,500
+12:55:06  cursor 1,324,500
+12:58:26  alarm cleared
+```
+
+— against the failing run, where a sustained alarm held the backfill at 108 rows/s for
+13 minutes. Removing the queue that never drains turned a sustained block into a transient
+one. Five consecutive cold runs then passed in 326–389s, with G3 costing 5–7 attempts each
+time against its budget of 30.
+
+The peak itself is untouched, so a machine with substantially less than 8 GB could still
+stall. The fix is the one D6 already names — raise prefetch and batch-commit the projection,
+or run several consumers on the same queue — and it is not built. That belongs in the
+README's capacity notes, stated as a measured limit rather than as a solved problem.

@@ -18,13 +18,6 @@ export async function ensureRabbitmqTopology(channel: ConfirmChannel): Promise<v
 
   await channel.assertQueue(config.RABBITMQ_QUEUE, { durable: true });
   await channel.bindQueue(config.RABBITMQ_QUEUE, config.RABBITMQ_EXCHANGE, ROUTING_PATTERN);
-
-  await channel.assertQueue(config.RABBITMQ_ANALYTICS_QUEUE, { durable: true });
-  await channel.bindQueue(
-    config.RABBITMQ_ANALYTICS_QUEUE,
-    config.RABBITMQ_EXCHANGE,
-    ROUTING_PATTERN,
-  );
 }
 
 export async function createRabbitmqConnection(): Promise<RabbitmqConnection> {
