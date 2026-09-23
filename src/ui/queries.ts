@@ -20,8 +20,6 @@ export const keys = {
   products: (query: string, page: number) => ['products', query, page] as const,
 };
 
-/** Errors surface rather than being retried away: a failing admin call is information, and
- *  the polling interval already recovers once the api is reachable again. */
 export function createQueryClient(): QueryClient {
   return new QueryClient({
     defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } },
@@ -58,8 +56,6 @@ export interface ProductSearch {
   hits: ProductHit[];
 }
 
-/** Keyed on the term and page, so a slow response for an abandoned search can no longer
- *  overwrite a newer one — the race the hand-rolled effect had. */
 export function useProductSearch(query: string, page: number, pageSize: number) {
   return useQuery({
     queryKey: keys.products(query, page),
@@ -77,8 +73,6 @@ export function useProductSearch(query: string, page: number, pageSize: number) 
 
 export type ControlAction = () => Promise<unknown>;
 
-/** One mutation per screen, taking the action as its variable. Every control action
- *  invalidates the same three reads, so a screen cannot forget one. */
 export function useControlAction(): UseMutationResult<unknown, Error, ControlAction> {
   const client = useQueryClient();
 

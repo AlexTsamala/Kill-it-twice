@@ -33,7 +33,6 @@ export interface ProductHit {
 export class ProductsController {
   constructor(@Inject(ELASTICSEARCH_CLIENT) private readonly elasticsearch: Client) {}
 
-  /** Reads the alias, not the index, so a future reindex is invisible here (SPEC §6). */
   @Get()
   async search(@Query() query: unknown): Promise<SearchResponse> {
     const request = parseBody(querySchema, query);
