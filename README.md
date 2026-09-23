@@ -213,10 +213,43 @@ what G3 saw.
 
 ---
 
+## Why 2,000,000 rows
+
+The dataset size is a design decision, not a default. Each reason below is about making a
+gate mean something; a smaller number would let the same gates pass while proving less.
+
+**It is above the in-memory threshold.** 2,000,000 rows do not fit in a Node heap, so keyset
+pagination and streaming are load-bearing rather than decorative. At 10,000 rows an accidental
+`SELECT * FROM products` would pass every gate in this repository and hide the bug completely.
+
+**A mid-run kill is meaningful.** The backfill runs about 145 seconds, so a kill triggered on
+checkpoint position lands genuinely mid-stream — measured between 402,500 and 421,000 across
+runs, never at zero and never after completion. At 10,000 rows the backfill finishes before the
+kill signal is delivered, and G1 would be asserting on a pipeline that had already stopped.
+
+**It still fits the time budget.** All five gates from cold in 371–393 seconds, against the
+fifteen minutes in SPEC §2. A reviewer will run `make verify` twice; at 20,000,000 rows they
+would run it once, or not at all.
+
+**Seeding is not the bottleneck.** `COPY FROM STDIN` writes 2,000,000 rows in 4.6 seconds, so
+re-running from scratch costs nothing and there is no temptation to skip the cold start.
+
+**I deliberately did not go to 20,000,000.** It would prove nothing additional about any gate.
+Every property being tested here — resumption from a checkpoint, idempotent re-delivery,
+bounded backoff, per-item rejection — is qualitative. Ten times the data exercises the same
+code paths ten times more slowly.
+
+The one number that was wrong: the spec estimated ~1.2 GB at 400–600 bytes per row before any
+code existed. Measured, it is **526 MB** — 423 MB heap plus 103 MB indexes, about 276 bytes
+per row, roughly half the estimate. The reasoning above rests on row count rather than bytes,
+so it survived the correction; the spec was amended in v4 rather than the measurement
+explained away.
+
+---
+
 ## Capacity
 
-Everything below is measured, not estimated. Where an earlier estimate was wrong, the spec was
-corrected rather than the measurement.
+Everything below is measured, not estimated.
 
 | Stage | Throughput | Notes |
 | --- | --- | --- |
@@ -224,10 +257,7 @@ corrected rather than the measurement.
 | Backfill → Elasticsearch only | ~70,800 rows/s | measured before D6 put RabbitMQ in the path |
 | Backfill → both sinks | ~14,000 rows/s | 2,000,000 in 144s |
 | Consumer → projection | ~8,000 events/s | the bottleneck |
-| Full `make verify` | 326–389s | all five gates, cold, across five runs |
-
-Data size: **526 MB** for 2,000,000 rows — 423 MB heap plus 103 MB indexes, about 276 bytes
-per row.
+| Full `make verify` | 371–393s | all five gates, cold, including a 60s outage |
 
 ### The bottleneck is the consumer, and it was predicted
 
