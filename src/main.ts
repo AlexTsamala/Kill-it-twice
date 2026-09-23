@@ -28,6 +28,15 @@ function serveUi(app: NestExpressApplication): void {
   app.useStaticAssets(assets);
 }
 
+/** Node exits on an unhandled rejection, which is right — the state is unknown. Logging it
+ *  through pino first is what makes it diagnosable instead of a bare stack trace. */
+function reportUnhandledRejections(): void {
+  process.on('unhandledRejection', (reason: unknown) => {
+    logger.error({ err: reason }, 'unhandled rejection; exiting');
+    process.exit(1);
+  });
+}
+
 function onShutdownSignal(stop: () => void): void {
   for (const signal of ['SIGTERM', 'SIGINT'] as const) {
     process.once(signal, () => {
@@ -94,6 +103,7 @@ async function runRole(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  reportUnhandledRejections();
   logger.info('starting');
   await runRole();
 }

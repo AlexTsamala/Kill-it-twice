@@ -214,3 +214,41 @@ is uninstalled rather than left in `package.json` unused.
 particular. Every label value here is an identifier we generate (`backfill`, `elasticsearch`,
 `transient`), so there is nothing to escape today. If a label ever carries free text, that
 assumption breaks and prom-client becomes the right answer again.
+
+---
+
+## 2026-09-23 — an open browser tab stopped the api from starting
+
+**Asked for:** Phase 6b — SPEC §11 screen 2's live feed, "a live feed panel streams recent
+change events over SSE".
+
+**What happened:** the next `make verify` never reached its first gate. It printed "Cold start"
+and stopped. The stack was up, but `products` did not exist, and the api and worker were
+restarting in a loop.
+
+**Why it was wrong:** the SSE controller polled the database from a hand-rolled async loop
+started with `void tick()`. Nothing caught a rejection from it. A browser tab left open on the
+UI kept reconnecting its `EventSource` to the freshly-wiped stack, the poll queried
+`runtime_settings` before migrations had created it, and the rejection reached the process as
+an unhandled rejection — which Node exits on. The api died, restarted, was reconnected to, and
+died again. `docker compose up --wait` never saw it healthy, so `cold_start` aborted before
+running migrations.
+
+This is the same mistake as the 2026-09-20 entry: a promise started with `void` and no
+`.catch`. I fixed that one in the consumer's serialiser and then wrote the identical bug into
+a new file three days later.
+
+The severity is what makes it worth recording. A read-only endpoint nobody had deliberately
+opened took down the whole api, and it only surfaced because a browser tab happened to be
+pointing at it across a cold start. Without that tab it would have shipped, and the first
+reviewer to leave the UI open while re-running `make verify` would have hit it.
+
+**Resolution:** the feed is now an rxjs `interval` pipeline with `catchError`, so a failed poll
+logs, yields nothing, and the stream continues. `main.ts` also installs an
+`unhandledRejection` handler that logs through pino before exiting — the crash stays, because
+unknown state should not be continued from, but it is now a structured log line rather than a
+bare stack trace.
+
+**Still open:** nothing enforces this. `no-floating-promises` does not catch `void promise`,
+which is exactly what the rule tells you to write. A lint rule banning `void` on a promise
+without a `.catch` would have caught both instances.

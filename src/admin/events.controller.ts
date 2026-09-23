@@ -1,11 +1,13 @@
 import { Controller, Inject, Sse, type MessageEvent } from '@nestjs/common';
-import { Observable, from, mergeMap, of } from 'rxjs';
+import { Observable, catchError, concatMap, from, interval, map, mergeMap, of } from 'rxjs';
 import { z } from 'zod';
 
 import { DATABASE, type Database } from '../common/database.js';
-import { readRuntimeSettings } from '../common/runtime-settings.js';
+import { logger } from '../common/logger.js';
 
 const FEED_BATCH = 25;
+const FEED_POLL_MS = 1000;
+const PIPELINE = 'sse';
 
 const eventRowSchema = z.object({
   id: z.coerce.number().int(),
@@ -24,29 +26,24 @@ export class EventsController {
 
   constructor(@Inject(DATABASE) private readonly database: Database) {}
 
-  /** Tails the outbox rather than the queue: the outbox is the durable record of what
-   *  changed, and reading it does not compete with the consumer for messages. */
+  /**
+   * Tails the outbox rather than the queue: the outbox is the durable record of what changed,
+   * and reading it does not compete with the consumer for messages. A failed poll yields
+   * nothing and the stream continues — an open browser tab must not be able to end the api.
+   */
   @Sse('stream')
   stream(): Observable<MessageEvent> {
-    return new Observable<void>((subscriber) => {
-      let cancelled = false;
-
-      const tick = async (): Promise<void> => {
-        while (!cancelled) {
-          subscriber.next();
-          const { outboxPollIntervalMs } = await readRuntimeSettings(this.database);
-          await new Promise((resolve) => setTimeout(resolve, Math.max(outboxPollIntervalMs, 500)));
-        }
-      };
-
-      void tick();
-      return () => {
-        cancelled = true;
-      };
-    }).pipe(
-      mergeMap(() => from(this.#recentChanges()), 1),
+    return interval(FEED_POLL_MS).pipe(
+      concatMap(() =>
+        from(this.#recentChanges()).pipe(
+          catchError((error: unknown) => {
+            logger.warn({ pipeline: PIPELINE, err: error }, 'change feed poll failed');
+            return of([]);
+          }),
+        ),
+      ),
       mergeMap((events) => from(events)),
-      mergeMap((event) => of({ data: event } satisfies MessageEvent)),
+      map((event) => ({ data: event }) satisfies MessageEvent),
     );
   }
 

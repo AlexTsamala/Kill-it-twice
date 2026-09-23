@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 #
-# verify.sh — the graded deliverable. Runs G1..G4 from SPEC §9 against a cold stack and
+# verify.sh — the graded deliverable. Runs G1..G5 from SPEC §9 against a cold stack and
 # prints one PASS/FAIL line per gate. Never sleeps and hopes: every wait polls a condition.
 #
 # Usage: ./verify.sh                (cold start, all gates — the graded run)
 #        ./verify.sh --keep         (reuse the running stack, all gates)
 #        ./verify.sh --keep g3 g4   (reuse the stack, run only those gates)
+#
+# G5 asserts on measurements G3 takes during its outage, so it needs G3 in the same run.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -61,6 +63,14 @@ es_count() {
   es "/${ELASTICSEARCH_INDEX}/_refresh" >/dev/null || true
   es "/${ELASTICSEARCH_INDEX}/_count" | jq -r '.count' 2>/dev/null || echo 0
 }
+
+# Reads one sample out of the exposition format by its exact name and labels.
+metric_value() {
+  curl -sf "http://localhost:${HTTP_PORT}/metrics" 2>/dev/null |
+    grep -v '^#' | grep -F "$1 " | head -1 | awk '{ print $NF }'
+}
+
+status_field() { api /admin/status | jq -r "$1"; }
 
 source_count()     { sql "SELECT count(*) FROM products WHERE deleted_at IS NULL"; }
 projection_count() { sql "SELECT count(*) FROM product_projection"; }
@@ -200,6 +210,7 @@ gate_g2() {
 
 gate_g3() {
   say "G3 — 60s Elasticsearch outage"
+  G3_RAN=true
   local outage_seconds=60
   local checkpoint_before cpu_total=0 cpu_samples=0
   checkpoint_before=$(checkpoint_of incremental)
@@ -212,10 +223,15 @@ gate_g3() {
 
   local deadline=$(($(date +%s) + outage_seconds))
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    local sample
+    local sample lag
     sample=$(worker_cpu)
     cpu_total=$(echo "$cpu_total + $sample" | bc)
     cpu_samples=$((cpu_samples + 1))
+
+    lag=$(metric_value 'replication_lag_seconds')
+    if [ -n "$lag" ] && [ "$(echo "$lag > $G5_PEAK_LAG" | bc)" -eq 1 ]; then
+      G5_PEAK_LAG=$lag
+    fi
     sleep 2
   done
 
@@ -227,10 +243,16 @@ gate_g3() {
   checkpoint_during=$(checkpoint_of incremental)
 
   docker compose start elasticsearch >/dev/null 2>&1
-  local recovery_start
+  local recovery_start recovery_deadline throughput
   recovery_start=$(date +%s)
-  poll_until "pipeline to drain after recovery" 300 '[ "$(outbox_pending)" -eq 0 ]' || true
+  recovery_deadline=$((recovery_start + 300))
+
+  while [ "$(outbox_pending)" -ne 0 ] && [ "$(date +%s)" -lt "$recovery_deadline" ]; do
+    sleep 1
+  done
+
   local recovery_seconds=$(($(date +%s) - recovery_start))
+  G5_LAG_AFTER=$(metric_value 'replication_lag_seconds')
 
   local mean_cpu
   mean_cpu=$(echo "scale=1; $cpu_total / $cpu_samples" | bc)
@@ -347,10 +369,88 @@ g4_replay_survives() {
   es "/${ELASTICSEARCH_INDEX}/_doc/${doc_id}" | jq -e '.found == true' >/dev/null
 }
 
+# ------------------------------------------------- G5: observability ---
+
+# Throughput is only meaningful while something is moving, so G5 makes something move rather
+# than hoping another gate left the pipeline busy.
+sample_throughput_under_load() {
+  api_post /admin/simulate/mutations '{"count":400,"ratePerSecond":800}' >/dev/null 2>&1 || true
+
+  local deadline=$(($(date +%s) + 30)) throughput
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    throughput=$(metric_value 'pipeline_throughput_per_second{pipeline="incremental"}')
+    if [ -n "$throughput" ] && [ "$(echo "$throughput > $G5_PEAK_THROUGHPUT" | bc)" -eq 1 ]; then
+      G5_PEAK_THROUGHPUT=$throughput
+    fi
+    [ "$(outbox_pending)" -eq 0 ] && [ "$(echo "$G5_PEAK_THROUGHPUT > 0" | bc)" -eq 1 ] && break
+    sleep 1
+  done
+}
+
+# SPEC §9/G5: answer five questions from /metrics and /admin/status without reading code.
+# "Non-stale" is checked by cross-referencing each answer against the database — a hardcoded
+# or cached metric would still resolve, but it would not agree.
+gate_g5() {
+  say "G5 — observability"
+
+  sample_throughput_under_load
+
+  local cursor_metric cursor_sql dlq_metric dlq_sql lag_metric ready_code deps
+  cursor_metric=$(metric_value 'replication_last_processed_id{pipeline="backfill"}')
+  cursor_sql=$(checkpoint_of backfill)
+  dlq_metric=$(metric_value 'replication_dlq_depth')
+  dlq_sql=$(dlq_depth)
+  lag_metric=$(metric_value 'replication_lag_seconds')
+  ready_code=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:${HTTP_PORT}/ready")
+  deps=$(status_field '[.dependencies | to_entries[] | select(.value == false) | .key] | join(",")')
+
+  local status_cursor status_lag status_dlq
+  status_cursor=$(status_field '.checkpoints[] | select(.pipeline == "backfill") | .last_processed_id')
+  status_lag=$(status_field '.lagSeconds')
+  status_dlq=$(status_field '.dlqDepth')
+
+  info "1 where is the backfill   metric $cursor_metric · status $status_cursor · postgres $cursor_sql"
+  info "2 current throughput      peak ${G5_PEAK_THROUGHPUT}/s during recovery"
+  if $G3_RAN; then
+    info "3 incremental lag         peak ${G5_PEAK_LAG}s during the outage · ${G5_LAG_AFTER}s after · now $lag_metric"
+  else
+    info "3 incremental lag         now ${lag_metric}s (rise/fall not asserted — G3 did not run)"
+  fi
+  info "4 dlq depth               metric $dlq_metric · status $status_dlq · postgres $dlq_sql"
+  info "5 health                  /ready ${ready_code}${deps:+ · down: $deps}"
+
+  if [ -z "$cursor_metric" ] || [ -z "$dlq_metric" ] || [ -z "$lag_metric" ]; then
+    fail "G5 observability" "a question did not resolve from /metrics"
+  elif [ "${cursor_metric%.*}" -ne "$cursor_sql" ] || [ "$status_cursor" -ne "$cursor_sql" ]; then
+    fail "G5 observability" "backfill position is stale (metric $cursor_metric, postgres $cursor_sql)"
+  elif [ "${dlq_metric%.*}" -ne "$dlq_sql" ] || [ "$status_dlq" -ne "$dlq_sql" ]; then
+    fail "G5 observability" "dlq depth is stale (metric $dlq_metric, postgres $dlq_sql)"
+  elif [ "$ready_code" != "200" ] || [ -n "$deps" ]; then
+    fail "G5 observability" "/ready returned $ready_code${deps:+, down: $deps}"
+  elif [ "$(echo "$G5_PEAK_THROUGHPUT <= 0" | bc)" -eq 1 ]; then
+    fail "G5 observability" "throughput never rose above zero while the pipeline was draining"
+  elif $G3_RAN && [ "$(echo "$G5_PEAK_LAG < $LAG_RISE_THRESHOLD" | bc)" -eq 1 ]; then
+    fail "G5 observability" "lag only reached ${G5_PEAK_LAG}s during a ${LAG_RISE_THRESHOLD}s+ outage"
+  elif $G3_RAN && [ "$(echo "$G5_LAG_AFTER >= $G5_PEAK_LAG" | bc)" -eq 1 ]; then
+    fail "G5 observability" "lag did not fall after recovery (${G5_PEAK_LAG}s -> ${G5_LAG_AFTER}s)"
+  elif $G3_RAN; then
+    pass "G5 observability" \
+      "5/5 answered, lag ${G5_PEAK_LAG}s -> ${G5_LAG_AFTER}s across the outage, ready 200"
+  else
+    pass "G5 observability" "4/5 answered; the lag rise needs G3 in the same run"
+  fi
+}
+
 # ------------------------------------------------------------------ main ---
 
 KILL_CHECKPOINTS=()
 KILL_RESUMES=()
+G5_PEAK_LAG=0
+G5_LAG_AFTER=0
+G5_PEAK_THROUGHPUT=0
+G3_RAN=false
+# The outage lasts 60s, so a live lag metric has to climb well past this before recovery.
+LAG_RISE_THRESHOLD=20
 
 $KEEP_STACK || cold_start
 
@@ -360,6 +460,7 @@ if wanted g1 || wanted g2; then
 fi
 wanted g3 && gate_g3
 wanted g4 && gate_g4
+wanted g5 && gate_g5
 
 say "Summary"
 printf '  elapsed %ss\n' "$(($(date +%s) - STARTED_AT))"
