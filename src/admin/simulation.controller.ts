@@ -2,6 +2,7 @@ import { Body, Controller, Delete, Get, Inject, Post } from '@nestjs/common';
 import { z } from 'zod';
 
 import { DATABASE, type Database } from '../common/database.js';
+import { writeRuntimeSetting } from '../common/runtime-settings.js';
 import {
   SIMULATED_SINKS,
   countPendingPoison,
@@ -64,6 +65,15 @@ export class SimulationController {
   @Delete('poison')
   async clearPoison(): Promise<unknown> {
     return this.poisonCleanup.removeAll();
+  }
+
+  /** SPEC §11 screen 4: kill the worker. The api has no Docker socket, so the worker polls
+   *  this flag and exits 137 without running its shutdown hooks — the same ungraceful death
+   *  G1 produces with docker kill. */
+  @Post('kill-worker')
+  async killWorker(): Promise<{ killRequested: boolean }> {
+    await writeRuntimeSetting(this.database, 'kill_worker', 'true');
+    return { killRequested: true };
   }
 
   @Post('mutations')

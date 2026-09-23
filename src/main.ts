@@ -1,6 +1,11 @@
 import 'reflect-metadata';
 
+import { existsSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { NestFactory } from '@nestjs/core';
+import type { NestExpressApplication } from '@nestjs/platform-express';
 
 import { AdminModule } from './admin/admin.module.js';
 import { config } from './common/config.js';
@@ -10,6 +15,18 @@ import { ProductConsumer } from './consumer/product.consumer.js';
 import { BackfillWorker } from './replication/backfill/backfill.worker.js';
 import { IncrementalWorker } from './replication/incremental/incremental.worker.js';
 import { ReplicationModule } from './replication/replication.module.js';
+
+/** The built UI ships inside the image; an unbuilt checkout simply has no assets to serve,
+ *  which must not stop the api from starting. */
+function serveUi(app: NestExpressApplication): void {
+  const assets = join(dirname(fileURLToPath(import.meta.url)), '..', 'ui');
+  if (!existsSync(assets)) {
+    logger.warn({ assets }, 'ui assets not found; serving the api only');
+    return;
+  }
+
+  app.useStaticAssets(assets);
+}
 
 function onShutdownSignal(stop: () => void): void {
   for (const signal of ['SIGTERM', 'SIGINT'] as const) {
@@ -49,8 +66,9 @@ async function runConsumer(): Promise<void> {
 }
 
 async function runApi(): Promise<void> {
-  const app = await NestFactory.create(AdminModule, { logger: false });
+  const app = await NestFactory.create<NestExpressApplication>(AdminModule, { logger: false });
   app.enableShutdownHooks();
+  serveUi(app);
   await app.listen(config.HTTP_PORT);
   logger.info({ port: config.HTTP_PORT }, 'admin api listening');
 

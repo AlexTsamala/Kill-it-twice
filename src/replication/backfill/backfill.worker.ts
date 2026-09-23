@@ -1,3 +1,5 @@
+import { setTimeout as delay } from 'node:timers/promises';
+
 import { Inject, Injectable } from '@nestjs/common';
 import { z } from 'zod';
 
@@ -11,6 +13,7 @@ import {
   MetricsRecorder,
 } from '../../common/metrics.js';
 import { type RetryOptions, waitAfterFailedRound } from '../../common/retry.js';
+import { type RuntimeSettings, readRuntimeSettings } from '../../common/runtime-settings.js';
 import { writeBatchWithRetry } from '../batch-writer.js';
 import { advanceCheckpoint, readCheckpoint, setPipelineStatus } from '../checkpoint.js';
 import { type DeadLetterEntry, deadLetterAndAdvanceCheckpoint } from '../dlq/dlq.repository.js';
@@ -87,6 +90,7 @@ function toDeadLetterEntry(
 export class BackfillWorker {
   #stopRequested = false;
   #consecutiveFailures = 0;
+  #idleStatus: 'running' | 'paused' | 'completed' = 'running';
   readonly #abort = new AbortController();
 
   constructor(
@@ -114,10 +118,20 @@ export class BackfillWorker {
     let nextProgressAt = PROGRESS_EVERY_ROWS;
 
     while (!this.#stopRequested) {
-      const documents = await this.#fetchNextBatch(cursor);
+      const settings = await readRuntimeSettings(this.database);
+
+      if (settings.backfillPaused) {
+        cursor = await this.#idle('paused', cursor, settings);
+        continue;
+      }
+
+      const documents = await this.#fetchNextBatch(cursor, settings.batchSize);
       const lastDocument = documents.at(-1);
       if (lastDocument === undefined) {
-        break;
+        // Idle rather than return: the control API can reset the checkpoint, and a worker
+        // that had already exited its loop would never notice.
+        cursor = await this.#idle('completed', cursor, settings);
+        continue;
       }
 
       const counts = await this.#tryBatch(documents, cursor);
@@ -127,6 +141,7 @@ export class BackfillWorker {
       }
       this.#consecutiveFailures = 0;
 
+      await this.#markRunning();
       cursor = lastDocument.id;
       applied += counts.applied;
       versionConflicts += counts.versionConflicts;
@@ -137,9 +152,7 @@ export class BackfillWorker {
       }
     }
 
-    const paused = this.#stopRequested;
-    await setPipelineStatus(this.database, PIPELINE, paused ? 'paused' : 'completed');
-
+    await setPipelineStatus(this.database, PIPELINE, 'paused');
     logger.info(
       {
         pipeline: PIPELINE,
@@ -148,8 +161,41 @@ export class BackfillWorker {
         versionConflicts,
         elapsedSeconds: Number(((Date.now() - startedAt) / 1000).toFixed(1)),
       },
-      paused ? 'backfill paused for shutdown' : 'backfill complete',
+      'backfill paused for shutdown',
     );
+  }
+
+  async #markRunning(): Promise<void> {
+    if (this.#idleStatus === 'running') {
+      return;
+    }
+
+    this.#idleStatus = 'running';
+    await setPipelineStatus(this.database, PIPELINE, 'running');
+  }
+
+  /** Reports the state once, then re-reads the checkpoint so a reset is picked up. */
+  async #idle(
+    status: 'paused' | 'completed',
+    cursor: number,
+    settings: RuntimeSettings,
+  ): Promise<number> {
+    if (this.#idleStatus !== status) {
+      this.#idleStatus = status;
+      await setPipelineStatus(this.database, PIPELINE, status);
+      logger.info({ pipeline: PIPELINE, cursor }, `backfill ${status}`);
+    }
+
+    await this.#sleep(settings.outboxPollIntervalMs);
+    return readCheckpoint(this.database, PIPELINE);
+  }
+
+  async #sleep(milliseconds: number): Promise<void> {
+    try {
+      await delay(milliseconds, undefined, { signal: this.#abort.signal });
+    } catch {
+      // Aborted by shutdown; the loop condition ends the run.
+    }
   }
 
   async #tryBatch(
@@ -229,14 +275,14 @@ export class BackfillWorker {
     }
   }
 
-  async #fetchNextBatch(afterId: number): Promise<ProductDocument[]> {
+  async #fetchNextBatch(afterId: number, batchSize: number): Promise<ProductDocument[]> {
     const { rows } = await this.database.query<Record<string, unknown>>(
       `SELECT id, sku, name, description, price, status, version, updated_at
          FROM products
         WHERE id > $1 AND deleted_at IS NULL
         ORDER BY id
         LIMIT $2`,
-      [afterId, config.BATCH_SIZE],
+      [afterId, batchSize],
     );
 
     return rows.map(toProductDocument);

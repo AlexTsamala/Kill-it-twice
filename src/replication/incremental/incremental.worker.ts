@@ -12,6 +12,7 @@ import {
   MetricsRecorder,
 } from '../../common/metrics.js';
 import { type RetryOptions, waitAfterFailedRound } from '../../common/retry.js';
+import { clearRuntimeSetting, readRuntimeSettings } from '../../common/runtime-settings.js';
 import { writeBatchWithRetry } from '../batch-writer.js';
 import { readCheckpoint, setPipelineStatus } from '../checkpoint.js';
 import {
@@ -125,16 +126,21 @@ export class IncrementalWorker {
   }
 
   async #pollOnce(): Promise<number> {
+    const settings = await readRuntimeSettings(this.database);
+    if (settings.killWorker) {
+      await this.#killUngracefully();
+    }
+
     // Poison takes slots from the batch rather than adding to it, so G4's "3 rejections in a
     // 500-record batch" is literally a batch of 500 (D7).
-    const poisonIds = await claimPendingPoison(this.database, config.BATCH_SIZE);
+    const poisonIds = await claimPendingPoison(this.database, settings.batchSize);
     const rows = await fetchUnprocessedOutboxRows(
       this.database,
-      config.BATCH_SIZE - poisonIds.length,
+      settings.batchSize - poisonIds.length,
     );
 
     if (rows.length === 0 && poisonIds.length === 0) {
-      await this.#waitBeforeNextPoll();
+      await this.#waitBeforeNextPoll(settings.outboxPollIntervalMs);
       return 0;
     }
 
@@ -235,9 +241,17 @@ export class IncrementalWorker {
     };
   }
 
-  async #waitBeforeNextPoll(): Promise<void> {
+  /** Simulates the ungraceful death G1 produces with docker kill: no shutdown hooks, no
+   *  final checkpoint write. The flag is cleared first so the restart does not re-kill. */
+  async #killUngracefully(): Promise<never> {
+    await clearRuntimeSetting(this.database, 'kill_worker');
+    logger.warn({ pipeline: PIPELINE }, 'kill requested from the simulation api; exiting 137');
+    process.exit(137);
+  }
+
+  async #waitBeforeNextPoll(milliseconds: number): Promise<void> {
     try {
-      await delay(config.OUTBOX_POLL_INTERVAL_MS, undefined, { signal: this.#abort.signal });
+      await delay(milliseconds, undefined, { signal: this.#abort.signal });
     } catch (error) {
       if (!(error instanceof Error) || error.name !== 'AbortError') {
         throw error;
