@@ -1,13 +1,8 @@
 import { useState } from 'react';
 
-import { getJson, patchJson, postJson } from '../api.js';
-import type { DeadLetter, RuntimeConfig, StatusReport } from '../types.js';
-import { usePolling } from '../usePolling.js';
-
-interface DlqPage {
-  rows: DeadLetter[];
-  count: number;
-}
+import { patchJson, postJson } from '../api.js';
+import { type ControlAction, useControlAction, useDeadLetters, useRuntimeConfig, useStatus } from '../queries.js';
+import type { DeadLetter } from '../types.js';
 
 const PAYLOAD_FIELDS = [
   'id',
@@ -27,34 +22,29 @@ function correctedPayload(row: DeadLetter): Record<string, unknown> {
 }
 
 export function ControlScreen(): React.JSX.Element {
-  const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string>();
   const [failed, setFailed] = useState(false);
 
-  const status = usePolling<StatusReport>(() => getJson<StatusReport>('/admin/status'));
-  const dlq = usePolling<DlqPage>(() => getJson<DlqPage>('/admin/dlq?limit=100'), 4000);
-  const config = usePolling<RuntimeConfig>(() => getJson<RuntimeConfig>('/admin/control/config'), 5000);
+  const { data: status } = useStatus();
+  const { data: dlq } = useDeadLetters();
+  const { data: config } = useRuntimeConfig();
+  const control = useControlAction();
 
-  const run = (label: string, action: () => Promise<unknown>) => () => {
-    setBusy(true);
-    action()
-      .then(() => {
+  const run = (label: string, action: ControlAction) => () => {
+    control.mutate(action, {
+      onSuccess: () => {
         setNotice(`${label} ok`);
         setFailed(false);
-        status.refresh();
-        dlq.refresh();
-        config.refresh();
-      })
-      .catch((cause: unknown) => {
-        setNotice(`${label} failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+      },
+      onError: (cause) => {
+        setNotice(`${label} failed: ${cause.message}`);
         setFailed(true);
-      })
-      .finally(() => {
-        setBusy(false);
-      });
+      },
+    });
   };
 
-  const paused = config.value?.backfillPaused ?? false;
+  const busy = control.isPending;
+  const paused = config?.backfillPaused ?? false;
 
   return (
     <>
@@ -63,7 +53,7 @@ export function ControlScreen(): React.JSX.Element {
       )}
 
       <section className="panel">
-        <h2>Backfill — {status.value?.checkpoints[0]?.status ?? '…'}</h2>
+        <h2>Backfill — {status?.checkpoints[0]?.status ?? '…'}</h2>
         <div className="row">
           <button
             className="action"
@@ -90,7 +80,7 @@ export function ControlScreen(): React.JSX.Element {
             Reset checkpoint to 0
           </button>
           <span className="muted">
-            cursor {(status.value?.checkpoints[0]?.last_processed_id ?? 0).toLocaleString('en-US')}
+            cursor {(status?.checkpoints[0]?.last_processed_id ?? 0).toLocaleString('en-US')}
           </span>
         </div>
         <p className="muted" style={{ marginBottom: 0 }}>
@@ -121,8 +111,8 @@ export function ControlScreen(): React.JSX.Element {
               name="batchSize"
               type="number"
               min={1}
-              defaultValue={config.value?.batchSize ?? 500}
-              key={`batch-${String(config.value?.batchSize)}`}
+              defaultValue={config?.batchSize ?? 500}
+              key={`batch-${String(config?.batchSize)}`}
               style={{ width: 100 }}
             />
           </label>
@@ -132,8 +122,8 @@ export function ControlScreen(): React.JSX.Element {
               name="outboxPollIntervalMs"
               type="number"
               min={1}
-              defaultValue={config.value?.outboxPollIntervalMs ?? 250}
-              key={`poll-${String(config.value?.outboxPollIntervalMs)}`}
+              defaultValue={config?.outboxPollIntervalMs ?? 250}
+              key={`poll-${String(config?.outboxPollIntervalMs)}`}
               style={{ width: 100 }}
             />
           </label>
@@ -143,8 +133,8 @@ export function ControlScreen(): React.JSX.Element {
               name="retryMaxAttempts"
               type="number"
               min={1}
-              defaultValue={config.value?.retryMaxAttempts ?? 5}
-              key={`retry-${String(config.value?.retryMaxAttempts)}`}
+              defaultValue={config?.retryMaxAttempts ?? 5}
+              key={`retry-${String(config?.retryMaxAttempts)}`}
               style={{ width: 80 }}
             />
           </label>
@@ -159,18 +149,18 @@ export function ControlScreen(): React.JSX.Element {
       </section>
 
       <section className="panel">
-        <h2>Dead letter queue — {dlq.value?.count ?? 0} rows</h2>
+        <h2>Dead letter queue — {dlq?.count ?? 0} rows</h2>
         <div className="row" style={{ marginBottom: 10 }}>
           <button
             className="action"
             type="button"
-            disabled={busy || (dlq.value?.count ?? 0) === 0}
+            disabled={busy || (dlq?.count ?? 0) === 0}
             onClick={run('replay all', () => postJson('/admin/dlq/replay-all'))}
           >
             Replay all
           </button>
         </div>
-        {(dlq.value?.rows ?? []).length === 0 ? (
+        {(dlq?.rows ?? []).length === 0 ? (
           <p className="muted">Empty. Inject poison records on the Simulation screen.</p>
         ) : (
           <table>
@@ -187,7 +177,7 @@ export function ControlScreen(): React.JSX.Element {
               </tr>
             </thead>
             <tbody>
-              {(dlq.value?.rows ?? []).map((row) => (
+              {(dlq?.rows ?? []).map((row) => (
                 <tr key={row.id}>
                   <td>{row.id}</td>
                   <td>{row.aggregate_id}</td>

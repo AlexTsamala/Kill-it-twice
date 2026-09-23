@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 
-import { getJson } from '../api.js';
+import { useProductSearch } from '../queries.js';
 import type { ChangeEvent, ProductHit } from '../types.js';
 
 const PAGE_SIZE = 20;
@@ -10,12 +10,6 @@ function text(value: unknown): string {
   return typeof value === 'string' || typeof value === 'number' ? String(value) : '';
 }
 const FEED_LIMIT = 30;
-
-interface SearchResult {
-  total: number;
-  reachable: number;
-  hits: ProductHit[];
-}
 
 function LiveFeed(): React.JSX.Element {
   const [events, setEvents] = useState<ChangeEvent[]>([]);
@@ -73,26 +67,9 @@ export function BrowserScreen(): React.JSX.Element {
   const [term, setTerm] = useState('');
   const [query, setQuery] = useState('');
   const [page, setPage] = useState(0);
-  const [result, setResult] = useState<SearchResult>();
   const [selected, setSelected] = useState<ProductHit>();
-  const [error, setError] = useState<string>();
 
-  useEffect(() => {
-    const params = new URLSearchParams({
-      q: query,
-      from: String(page * PAGE_SIZE),
-      size: String(PAGE_SIZE),
-    });
-
-    getJson<SearchResult>(`/admin/products?${params.toString()}`)
-      .then((next) => {
-        setResult(next);
-        setError(undefined);
-      })
-      .catch((cause: unknown) => {
-        setError(cause instanceof Error ? cause.message : String(cause));
-      });
-  }, [query, page]);
+  const { data: result, error } = useProductSearch(query, page, PAGE_SIZE);
 
   const total = result?.total ?? 0;
   const reachable = result?.reachable ?? 0;
@@ -128,7 +105,7 @@ export function BrowserScreen(): React.JSX.Element {
         </form>
       </section>
 
-      {error !== undefined && <p className="notice error">{error}</p>}
+      {error !== null && <p className="notice error">{error.message}</p>}
 
       <section className="panel">
         <table>

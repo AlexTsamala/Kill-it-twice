@@ -1,8 +1,6 @@
 import { useRef } from 'react';
 
-import { getJson } from '../api.js';
-import type { StatusReport } from '../types.js';
-import { POLL_INTERVAL_MS, usePolling } from '../usePolling.js';
+import { useStatus } from '../queries.js';
 
 const SPARK_SAMPLES = 40;
 
@@ -40,13 +38,10 @@ export function StatusScreen(): React.JSX.Element {
   const history = useRef<number[]>([]);
   const previous = useRef<{ cursor: number; at: number }>({ cursor: 0, at: 0 });
 
-  const { value: status, error } = usePolling<StatusReport>(
-    () => getJson<StatusReport>('/admin/status'),
-    POLL_INTERVAL_MS,
-  );
+  const { data: status, error } = useStatus();
 
-  if (error !== undefined && status === undefined) {
-    return <p className="notice error">Cannot reach the admin api: {error}</p>;
+  if (error !== null && status === undefined) {
+    return <p className="notice error">Cannot reach the admin api: {error.message}</p>;
   }
   if (status === undefined) {
     return <p className="muted">Loading…</p>;
@@ -68,7 +63,7 @@ export function StatusScreen(): React.JSX.Element {
 
   return (
     <>
-      {error !== undefined && <p className="notice error">Last poll failed: {error}</p>}
+      {error !== null && <p className="notice error">Last poll failed: {error.message}</p>}
 
       <section className="panel">
         <h2>Backfill</h2>

@@ -5,6 +5,7 @@ async function request<Result>(path: string, init?: RequestInit): Promise<Result
   });
 
   const body: unknown = await response.json().catch(() => null);
+
   if (!response.ok) {
     throw new Error(describe(body) ?? `${path} failed with ${String(response.status)}`);
   }

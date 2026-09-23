@@ -1,34 +1,30 @@
 import { useState } from 'react';
 
-import { deleteJson, getJson, postJson } from '../api.js';
-import type { StatusReport } from '../types.js';
-import { usePolling } from '../usePolling.js';
+import { deleteJson, postJson } from '../api.js';
+import { type ControlAction, useControlAction, useStatus } from '../queries.js';
 
 export function SimulationScreen(): React.JSX.Element {
-  const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string>();
   const [failed, setFailed] = useState(false);
 
-  const status = usePolling<StatusReport>(() => getJson<StatusReport>('/admin/status'));
+  const { data: status } = useStatus();
+  const control = useControlAction();
 
-  const run = (label: string, action: () => Promise<unknown>) => () => {
-    setBusy(true);
-    action()
-      .then((result) => {
+  const run = (label: string, action: ControlAction) => () => {
+    control.mutate(action, {
+      onSuccess: (result) => {
         setNotice(`${label}: ${JSON.stringify(result)}`);
         setFailed(false);
-        status.refresh();
-      })
-      .catch((cause: unknown) => {
-        setNotice(`${label} failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+      },
+      onError: (cause) => {
+        setNotice(`${label} failed: ${cause.message}`);
         setFailed(true);
-      })
-      .finally(() => {
-        setBusy(false);
-      });
+      },
+    });
   };
 
-  const sinks = status.value?.sinks;
+  const busy = control.isPending;
+  const sinks = status?.sinks;
 
   return (
     <>
@@ -88,7 +84,7 @@ export function SimulationScreen(): React.JSX.Element {
             >
               Clear artifacts
             </button>
-            <span className="muted">{status.value?.pendingPoison ?? 0} pending</span>
+            <span className="muted">{status?.pendingPoison ?? 0} pending</span>
           </form>
         </section>
 
