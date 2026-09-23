@@ -14,6 +14,7 @@ import {
 } from './sinks/elasticsearch.sink.js';
 import { EVENT_SINK } from './sinks/event-sink.js';
 import { PRODUCT_SINK } from './sinks/product-sink.js';
+import { SINKS, type Sinks } from './sinks/sinks.js';
 import {
   RABBITMQ_CONNECTION,
   RabbitmqEventSink,
@@ -32,6 +33,11 @@ import {
     // off from the admin API exercises the real retry path rather than a test-only branch.
     { provide: PRODUCT_SINK, useClass: SimulatedProductSink },
     { provide: EVENT_SINK, useClass: SimulatedEventSink },
+    {
+      provide: SINKS,
+      useFactory: (product: Sinks['product'], event: Sinks['event']): Sinks => ({ product, event }),
+      inject: [PRODUCT_SINK, EVENT_SINK],
+    },
     BackfillWorker,
     IncrementalWorker,
     DlqService,

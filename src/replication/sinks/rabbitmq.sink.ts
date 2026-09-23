@@ -2,6 +2,7 @@ import amqp, { type ChannelModel, type ConfirmChannel } from 'amqplib';
 import { Inject, Injectable } from '@nestjs/common';
 
 import { config } from '../../common/config.js';
+import { MetricsRecorder } from '../../common/metrics.js';
 import { EVENT_SINK, type EventSink, type ProductEvent } from './event-sink.js';
 
 export const RABBITMQ_CONNECTION = Symbol('RabbitmqConnection');
@@ -48,7 +49,10 @@ function waitForDrainOrThrow(channel: ConfirmChannel): Promise<void> {
 
 @Injectable()
 export class RabbitmqEventSink implements EventSink {
-  constructor(@Inject(RABBITMQ_CONNECTION) private readonly connection: RabbitmqConnection) {}
+  constructor(
+    @Inject(RABBITMQ_CONNECTION) private readonly connection: RabbitmqConnection,
+    private readonly metrics: MetricsRecorder,
+  ) {}
 
   async publishBatch(events: readonly ProductEvent[]): Promise<void> {
     if (events.length === 0) {
@@ -56,6 +60,7 @@ export class RabbitmqEventSink implements EventSink {
     }
 
     const { channel } = this.connection;
+    const startedAt = Date.now();
 
     for (const event of events) {
       const accepted = channel.publish(
@@ -71,6 +76,7 @@ export class RabbitmqEventSink implements EventSink {
     }
 
     await channel.waitForConfirms();
+    this.metrics.observeLatency('rabbitmq', Date.now() - startedAt);
   }
 }
 

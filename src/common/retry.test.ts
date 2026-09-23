@@ -45,7 +45,12 @@ describe('fullJitterDelayMs', () => {
 });
 
 describe('retryTransient', () => {
-  const options = { pipeline: 'test', signal: NEVER_ABORTED, random: alwaysZero };
+  const options = {
+    pipeline: 'test',
+    signal: NEVER_ABORTED,
+    random: alwaysZero,
+    onRetry: () => undefined,
+  };
 
   it('runs the work once when it succeeds', async () => {
     let calls = 0;

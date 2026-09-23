@@ -5,6 +5,12 @@ import { Inject, Injectable } from '@nestjs/common';
 import { config } from '../../common/config.js';
 import { DATABASE, type Database } from '../../common/database.js';
 import { logger } from '../../common/logger.js';
+import {
+  EVENTS_FAILED,
+  EVENTS_PROCESSED,
+  EVENTS_RETRIED,
+  MetricsRecorder,
+} from '../../common/metrics.js';
 import { type RetryOptions, waitAfterFailedRound } from '../../common/retry.js';
 import { writeBatchWithRetry } from '../batch-writer.js';
 import { readCheckpoint, setPipelineStatus } from '../checkpoint.js';
@@ -17,17 +23,15 @@ import {
 import { commitOutboxProgress, fetchUnprocessedOutboxRows, type OutboxRow } from '../outbox.js';
 import { buildOutboxEvent } from '../product-event.factory.js';
 import { claimPendingPoison, releasePoison } from '../simulation/simulation.repository.js';
-import { EVENT_SINK, type EventSink } from '../sinks/event-sink.js';
 import {
-  PRODUCT_SINK,
   type BulkItemFailure,
-  type ProductSink,
   type SinkOperation,
   deleteOperation,
   indexOperation,
   poisonDocumentBody,
   poisonOperation,
 } from '../sinks/product-sink.js';
+import { SINKS, type Sinks } from '../sinks/sinks.js';
 
 const PIPELINE = 'incremental';
 const POISON_EVENT_TYPE = 'product.snapshot';
@@ -98,8 +102,8 @@ export class IncrementalWorker {
 
   constructor(
     @Inject(DATABASE) private readonly database: Database,
-    @Inject(PRODUCT_SINK) private readonly productSink: ProductSink,
-    @Inject(EVENT_SINK) private readonly eventSink: EventSink,
+    @Inject(SINKS) private readonly sinks: Sinks,
+    private readonly metrics: MetricsRecorder,
   ) {}
 
   requestStop(): void {
@@ -150,11 +154,12 @@ export class IncrementalWorker {
   async #processBatch(rows: readonly OutboxRow[], poisonIds: readonly number[]): Promise<number> {
     const checkpointAt = await readCheckpoint(this.database, PIPELINE);
     const operations = [...rows.map(toSinkOperation), ...poisonIds.map(poisonOperation)];
-    const result = await writeBatchWithRetry(this.productSink, operations, this.#retryOptions());
+    const result = await writeBatchWithRetry(this.sinks.product, operations, this.#retryOptions());
     const advanceTo = rows.at(-1)?.id ?? checkpointAt;
 
     if (result.failures.length === 0) {
-      await this.eventSink.publishBatch(rows.map(buildOutboxEvent));
+      this.#countApplied(rows.length, rows.length);
+      await this.sinks.event.publishBatch(rows.map(buildOutboxEvent));
       await commitOutboxProgress(
         this.database,
         rows.map((row) => row.id),
@@ -175,7 +180,16 @@ export class IncrementalWorker {
     const failedPositions = new Set(batch.failures.map((failure) => failure.position));
     const survivors = batch.rows.filter((_, position) => !failedPositions.has(position));
 
-    await this.eventSink.publishBatch(survivors.map(buildOutboxEvent));
+    this.#countApplied(survivors.length, survivors.length);
+    for (const failure of batch.failures) {
+      this.metrics.increment(EVENTS_FAILED, {
+        pipeline: PIPELINE,
+        sink: 'elasticsearch',
+        reason: failure.errorClass,
+      });
+    }
+
+    await this.sinks.event.publishBatch(survivors.map(buildOutboxEvent));
 
     // D5: the failed items, the outbox rows they came from and the checkpoint move in one
     // transaction. 3 bad records must not roll back the 497 that Elasticsearch accepted.
@@ -194,6 +208,11 @@ export class IncrementalWorker {
     return survivors.length;
   }
 
+  #countApplied(indexed: number, published: number): void {
+    this.metrics.increment(EVENTS_PROCESSED, { pipeline: PIPELINE, sink: 'elasticsearch' }, indexed);
+    this.metrics.increment(EVENTS_PROCESSED, { pipeline: PIPELINE, sink: 'rabbitmq' }, published);
+  }
+
   #reportBatchFailure(error: unknown): void {
     if (this.#stopRequested) {
       return;
@@ -206,7 +225,14 @@ export class IncrementalWorker {
   }
 
   #retryOptions(): RetryOptions {
-    return { pipeline: PIPELINE, signal: this.#abort.signal, random: Math.random };
+    return {
+      pipeline: PIPELINE,
+      signal: this.#abort.signal,
+      random: Math.random,
+      onRetry: () => {
+        this.metrics.increment(EVENTS_RETRIED, { pipeline: PIPELINE, sink: 'elasticsearch' });
+      },
+    };
   }
 
   async #waitBeforeNextPoll(): Promise<void> {

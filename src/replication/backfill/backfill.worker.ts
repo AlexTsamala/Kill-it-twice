@@ -4,19 +4,23 @@ import { z } from 'zod';
 import { config } from '../../common/config.js';
 import { DATABASE, type Database } from '../../common/database.js';
 import { logger } from '../../common/logger.js';
+import {
+  EVENTS_FAILED,
+  EVENTS_PROCESSED,
+  EVENTS_RETRIED,
+  MetricsRecorder,
+} from '../../common/metrics.js';
 import { type RetryOptions, waitAfterFailedRound } from '../../common/retry.js';
 import { writeBatchWithRetry } from '../batch-writer.js';
 import { advanceCheckpoint, readCheckpoint, setPipelineStatus } from '../checkpoint.js';
 import { type DeadLetterEntry, deadLetterAndAdvanceCheckpoint } from '../dlq/dlq.repository.js';
 import { buildSnapshotEvent } from '../product-event.factory.js';
-import { EVENT_SINK, type EventSink } from '../sinks/event-sink.js';
 import {
-  PRODUCT_SINK,
   type BulkItemFailure,
   type ProductDocument,
-  type ProductSink,
   indexOperation,
 } from '../sinks/product-sink.js';
+import { SINKS, type Sinks } from '../sinks/sinks.js';
 
 const PIPELINE = 'backfill';
 const PROGRESS_EVERY_ROWS = 200_000;
@@ -87,8 +91,8 @@ export class BackfillWorker {
 
   constructor(
     @Inject(DATABASE) private readonly database: Database,
-    @Inject(PRODUCT_SINK) private readonly productSink: ProductSink,
-    @Inject(EVENT_SINK) private readonly eventSink: EventSink,
+    @Inject(SINKS) private readonly sinks: Sinks,
+    private readonly metrics: MetricsRecorder,
   ) {}
 
   requestStop(): void {
@@ -170,7 +174,7 @@ export class BackfillWorker {
 
   async #processBatch(documents: readonly ProductDocument[], cursor: number): Promise<BatchCounts> {
     const result = await writeBatchWithRetry(
-      this.productSink,
+      this.sinks.product,
       documents.map(indexOperation),
       this.#retryOptions(),
     );
@@ -180,7 +184,7 @@ export class BackfillWorker {
     const survivors = documents.filter((_, position) => !failedPositions.has(position));
 
     if (config.BACKFILL_PUBLISH_EVENTS) {
-      await this.eventSink.publishBatch(survivors.map(buildSnapshotEvent));
+      await this.sinks.event.publishBatch(survivors.map(buildSnapshotEvent));
     }
 
     const counts = {
@@ -188,9 +192,19 @@ export class BackfillWorker {
       versionConflicts: result.versionConflictCount,
     };
 
+    this.#countApplied(result.appliedCount + result.versionConflictCount, survivors.length);
+
     if (result.failures.length === 0) {
       await advanceCheckpoint(this.database, PIPELINE, advanceTo);
       return counts;
+    }
+
+    for (const failure of result.failures) {
+      this.metrics.increment(EVENTS_FAILED, {
+        pipeline: PIPELINE,
+        sink: 'elasticsearch',
+        reason: failure.errorClass,
+      });
     }
 
     await deadLetterAndAdvanceCheckpoint(this.database, {
@@ -208,6 +222,13 @@ export class BackfillWorker {
     return counts;
   }
 
+  #countApplied(indexed: number, published: number): void {
+    this.metrics.increment(EVENTS_PROCESSED, { pipeline: PIPELINE, sink: 'elasticsearch' }, indexed);
+    if (config.BACKFILL_PUBLISH_EVENTS) {
+      this.metrics.increment(EVENTS_PROCESSED, { pipeline: PIPELINE, sink: 'rabbitmq' }, published);
+    }
+  }
+
   async #fetchNextBatch(afterId: number): Promise<ProductDocument[]> {
     const { rows } = await this.database.query<Record<string, unknown>>(
       `SELECT id, sku, name, description, price, status, version, updated_at
@@ -222,7 +243,14 @@ export class BackfillWorker {
   }
 
   #retryOptions(): RetryOptions {
-    return { pipeline: PIPELINE, signal: this.#abort.signal, random: Math.random };
+    return {
+      pipeline: PIPELINE,
+      signal: this.#abort.signal,
+      random: Math.random,
+      onRetry: () => {
+        this.metrics.increment(EVENTS_RETRIED, { pipeline: PIPELINE, sink: 'elasticsearch' });
+      },
+    };
   }
 
   async #waitBeforeRetryRound(): Promise<void> {

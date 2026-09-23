@@ -5,6 +5,7 @@ import { Inject, Injectable, type OnModuleInit } from '@nestjs/common';
 import { config } from '../../common/config.js';
 import { classifyResponseStatus } from '../../common/errors.js';
 import { logger } from '../../common/logger.js';
+import { MetricsRecorder } from '../../common/metrics.js';
 import {
   type BulkItemFailure,
   type BulkWriteResult,
@@ -120,7 +121,10 @@ function summariseBulkResponse(response: estypes.BulkResponse): BulkWriteResult 
 
 @Injectable()
 export class ElasticsearchProductSink implements ProductSink, OnModuleInit {
-  constructor(@Inject(ELASTICSEARCH_CLIENT) private readonly client: Client) {}
+  constructor(
+    @Inject(ELASTICSEARCH_CLIENT) private readonly client: Client,
+    private readonly metrics: MetricsRecorder,
+  ) {}
 
   async onModuleInit(): Promise<void> {
     await ensureProductsIndex(this.client);
@@ -132,7 +136,10 @@ export class ElasticsearchProductSink implements ProductSink, OnModuleInit {
       return { appliedCount: 0, versionConflictCount: 0, failures: [] };
     }
 
+    const startedAt = Date.now();
     const response = await this.client.bulk({ operations: toBulkOperations(operations) });
+    this.metrics.observeLatency('elasticsearch', Date.now() - startedAt);
+
     return summariseBulkResponse(response);
   }
 }

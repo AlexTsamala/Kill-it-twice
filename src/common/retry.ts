@@ -8,6 +8,9 @@ export interface RetryOptions {
   readonly pipeline: string;
   readonly signal: AbortSignal;
   readonly random: () => number;
+  /** Called once per retry. A callback rather than a recorder keeps this file free of the
+   *  database, so the backoff stays unit-testable without a running Postgres. */
+  readonly onRetry: () => void;
 }
 
 export function backoffCeilingMs(attempt: number): number {
@@ -24,6 +27,7 @@ async function waitBeforeRetry(
   options: RetryOptions,
 ): Promise<void> {
   const delayMs = fullJitterDelayMs(attempt, options.random);
+  options.onRetry();
 
   logger.warn(
     { pipeline: options.pipeline, attempt: attempt + 1, delayMs, err: error },

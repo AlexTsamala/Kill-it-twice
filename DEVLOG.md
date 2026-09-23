@@ -181,3 +181,36 @@ The peak itself is untouched, so a machine with substantially less than 8 GB cou
 stall. The fix is the one D6 already names — raise prefetch and batch-commit the projection,
 or run several consumers on the same queue — and it is not built. That belongs in the
 README's capacity notes, stated as a measured limit rather than as a solved problem.
+
+---
+
+## 2026-09-22 — /metrics is rendered by hand, and prom-client was dropped
+
+**Asked for:** Phase 6a — "/metrics in Prometheus format, every metric listed in SPEC §10".
+`prom-client` is on AGENTS.md's approved dependency list, so the obvious reading is to use it.
+
+**What happened:** I installed it, then removed it again and wrote the exposition format
+directly.
+
+**Why it was wrong:** prom-client keeps its registry in the process that serves it. D8 puts
+`/metrics` in the `api` role, but every counter it needs is incremented somewhere else —
+`replication_events_processed_total` in the worker, the consumer's projection writes in the
+consumer, `sink_write_latency_ms` in both. Three containers, three heaps, and the api can see
+none of them.
+
+So the counters have to be aggregated through Postgres regardless of which library renders
+them, and once they are rows in a table, prom-client stops helping. Counters could be replayed
+into it with `inc()` per scrape, but a histogram cannot: the api holds bucket counts, and
+`Histogram` only accepts raw observations through `observe()`. Reconstructing one would mean
+fabricating observations to land in the right buckets.
+
+**Resolution:** workers and consumer flush counter deltas to `replication_metrics` (migration
+0008), additively so a restart adds to the total rather than resetting it. The api reads that
+table, computes the gauges live from Postgres and RabbitMQ, and renders the text format — about
+25 lines, including cumulative histogram buckets in the shape Prometheus expects. `prom-client`
+is uninstalled rather than left in `package.json` unused.
+
+**The trade:** hand-rendering means owning the format's edge cases — label escaping in
+particular. Every label value here is an identifier we generate (`backfill`, `elasticsearch`,
+`transient`), so there is nothing to escape today. If a label ever carries free text, that
+assumption breaks and prom-client becomes the right answer again.

@@ -5,6 +5,7 @@ import { config } from '../common/config.js';
 import { DATABASE, type Database } from '../common/database.js';
 import { classifyThrownError } from '../common/errors.js';
 import { logger } from '../common/logger.js';
+import { EVENTS_FAILED, EVENTS_PROCESSED, MetricsRecorder } from '../common/metrics.js';
 import { productEventSchema } from '../replication/sinks/event-sink.js';
 import {
   RABBITMQ_CONNECTION,
@@ -27,6 +28,7 @@ export class ProductConsumer {
   constructor(
     @Inject(DATABASE) private readonly database: Database,
     @Inject(RABBITMQ_CONNECTION) private readonly connection: RabbitmqConnection,
+    private readonly metrics: MetricsRecorder,
   ) {}
 
   async start(): Promise<void> {
@@ -71,9 +73,15 @@ export class ProductConsumer {
       const outcome = await applyProductEvent(this.database, event);
 
       this.#record(outcome);
+      this.metrics.increment(EVENTS_PROCESSED, { pipeline: PIPELINE, sink: 'projection' });
       channel.ack(message);
     } catch (error) {
       const errorClass = classifyThrownError(error);
+      this.metrics.increment(EVENTS_FAILED, {
+        pipeline: PIPELINE,
+        sink: 'projection',
+        reason: errorClass,
+      });
       logger.error(
         { pipeline: PIPELINE, errorClass, messageId: message.properties.messageId, err: error },
         'projection failed',

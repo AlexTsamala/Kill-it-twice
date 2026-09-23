@@ -28,6 +28,8 @@ const schema = z.object({
   OUTBOX_POLL_INTERVAL_MS: positiveInt,
   BACKFILL_PUBLISH_EVENTS: booleanFromEnv,
 
+  METRICS_FLUSH_INTERVAL_MS: positiveInt,
+
   RETRY_MAX_ATTEMPTS: positiveInt,
   RETRY_BASE_MS: positiveInt,
   RETRY_CAP_MS: positiveInt,
