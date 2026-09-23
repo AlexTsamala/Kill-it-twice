@@ -252,3 +252,40 @@ bare stack trace.
 **Still open:** nothing enforces this. `no-floating-promises` does not catch `void promise`,
 which is exactly what the rule tells you to write. A lint rule banning `void` on a promise
 without a `.catch` would have caught both instances.
+
+---
+
+## 2026-09-23 — the documented first command does not work on a clean clone
+
+**Asked for:** Phase 8 — clone the repository to a fresh directory and run exactly what a
+reviewer would run: `docker compose up -d`, `make seed`, `make verify`.
+
+**What happened:** the first command failed immediately.
+
+```
+$ docker compose up -d
+warning: The "POSTGRES_USER" variable is not set. Defaulting to a blank string.
+...
+no port specified: :<empty>
+```
+
+**Why it was wrong:** `.env` is gitignored, which is right — but Docker Compose reads `.env`
+for variable interpolation, and every `${POSTGRES_USER}`, `${HTTP_PORT}` and friend in
+`docker-compose.yml` resolved to an empty string. `make up` works, because the Makefile has a
+`.env: cp .env.example .env` target, and `verify.sh` works, because it does the same check
+itself. Only the bare compose command is broken — and it is the one `CLAUDE.md` tells a
+reviewer to type.
+
+Eight days of local work could never have caught this. `.env` has existed in the working
+directory since Phase 1, so every command worked here every time. It took cloning into an
+empty directory to see it, which is exactly what this phase is for.
+
+**Resolution:** no code change. Adding `${POSTGRES_USER:-app}` style defaults to the compose
+file was rejected: AGENTS.md §4 forbids hardcoded credentials and ports, and it would create a
+second set of defaults alongside `.env.example` that can drift apart silently. The README now
+states the requirement and why. `CLAUDE.md`'s Commands block still says `docker compose up -d`
+and needs its one line changed to `make up` — that file is the human's, so it is flagged
+rather than edited.
+
+**Verified after:** clean clone, `make up`, `make seed`, `make verify` — all five gates passed
+in 393s, then again in 371s with no cleanup between runs.

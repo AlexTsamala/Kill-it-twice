@@ -28,6 +28,11 @@ make verify      # the five gates, from a cold start
 
 The UI is at **http://localhost:3000**, served by the `api` container.
 
+**Use `make up`, not `docker compose up` directly.** `.env` is deliberately not committed, and
+compose needs it for interpolation — without it every `${VAR}` resolves to empty and it fails
+with `no port specified`. The Makefile creates `.env` from `.env.example` on first use, and
+`verify.sh` does the same, so both work on a fresh clone with nothing else installed.
+
 | Command | What it does |
 | --- | --- |
 | `make up` | build and start everything, waiting for healthchecks |
@@ -177,6 +182,10 @@ Measured on the run recorded in `verify-output.txt`, from a cold start on a 2021
 | G5 observability | **PASS** | 5/5 questions answered, lag 59.7s → 0s across the outage, `/ready` 200 |
 
 Total: **371 seconds**, against the fifteen-minute budget in SPEC §2.
+
+Reproduced from a clean clone — `git clone`, `make up`, `make seed`, `make verify` on a machine
+that had never built this project — passing in 393s, then again in 371s with no cleanup between
+the two runs.
 
 The G5 line is the one worth reading twice. A 60-second outage produced 59.7 seconds of lag
 and then zero — a number that can only track the outage that closely if it is computed from
