@@ -9,11 +9,11 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
     ports:
-      - "${POSTGRES_PORT}:5432"
+      - '${POSTGRES_PORT}:5432'
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      test: ['CMD-SHELL', 'pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}']
       interval: 5s
       timeout: 5s
       retries: 30
@@ -24,10 +24,11 @@ services:
     restart: unless-stopped
     environment:
       discovery.type: single-node
-      xpack.security.enabled: "false"
+      xpack.security.enabled: 'false'
       ES_JAVA_OPTS: ${ES_JAVA_OPTS}
+      action.auto_create_index: '-products*,+*'
     ports:
-      - "${ELASTICSEARCH_PORT}:9200"
+      - '${ELASTICSEARCH_PORT}:9200'
     volumes:
       - elasticsearch-data:/usr/share/elasticsearch/data
     ulimits:
@@ -52,12 +53,12 @@ services:
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS}
     ports:
-      - "${RABBITMQ_PORT}:5672"
-      - "${RABBITMQ_MANAGEMENT_PORT}:15672"
+      - '${RABBITMQ_PORT}:5672'
+      - '${RABBITMQ_MANAGEMENT_PORT}:15672'
     volumes:
       - rabbitmq-data:/var/lib/rabbitmq
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      test: ['CMD', 'rabbitmq-diagnostics', '-q', 'ping']
       interval: 10s
       timeout: 10s
       retries: 20
@@ -73,7 +74,7 @@ services:
     environment:
       APP_ROLE: api
     ports:
-      - "${HTTP_PORT}:${HTTP_PORT}"
+      - '${HTTP_PORT}:${HTTP_PORT}'
     depends_on:
       postgres:
         condition: service_healthy
@@ -128,13 +129,13 @@ services:
     build:
       context: .
     image: kill-it-twice:local
-    profiles: ["tools"]
+    profiles: ['tools']
     env_file:
       - .env
     depends_on:
       postgres:
         condition: service_healthy
-    command: ["node", "dist/scripts/migrate.js"]
+    command: ['node', 'dist/scripts/migrate.js']
 
 volumes:
   postgres-data:

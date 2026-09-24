@@ -282,10 +282,21 @@ In the order I would actually try them:
 
 ### The capacity limit that is still there
 
-Removing the demonstration queue (see below) roughly tripled the broker's headroom but did not
-remove the peak. On a machine with meaningfully less than 8 GB, 925,000 queued messages could
-still trip RabbitMQ's memory watermark and block publishers. The fix is item 1 above — a
-faster consumer never lets the backlog build — and it is not implemented.
+Removing the demonstration queue roughly tripled the broker's headroom but did not remove the
+peak, and **this is observed rather than theoretical**. A run on this same 8 GB machine, with
+several days of images and build cache resident and another stack having been up earlier, hit
+`system_memory_high_watermark` and collapsed the backfill to 262–612 rows/s. It took 2012s and
+failed four gates. Freeing Docker's reclaimable space and re-running passed in 311s.
+
+So the honest statement is not "a smaller machine might struggle". It is: **at 925,000 queued
+messages this pipeline is close enough to the watermark that ordinary developer memory pressure
+can cross it.** Nothing was lost either time — the checkpoint held and the counts converged
+once it recovered — but the run blew the fifteen-minute budget.
+
+The fix is item 1 above: batch-committing projection writes so the consumer keeps up and the
+backlog never reaches that depth. It is not implemented. Raising the watermark or shrinking
+Elasticsearch's heap would make the symptom disappear without touching the cause, which is why
+neither was done.
 
 ---
 
@@ -354,16 +365,9 @@ were worth it.
 **Decision.** The consumer chains handlers per `aggregateId`. Events for one product run in
 sequence; different products stay fully concurrent.
 
-**Why it exists.** The first full run produced 2,000,002 rows in the projection against
-2,000,001 in the source. A product created and soft-deleted moments apart survived its own
-deletion. A queue delivers in order, but `prefetch: 100` means a hundred handlers are in
-flight at once — nothing was serialising them, and `product.deleted` won the race against its
-own `product.created`. The DELETE matched zero rows; the INSERT then created the row.
-
-**Why the version guard could not catch it.** `WHERE excluded.version > product_projection.version`
-needs an existing row to compare against. After a delete there is none. The guard protects
-against a stale update overwriting a fresh one, which is what it was designed for. It says
-nothing about a delete arriving before the thing it deletes.
+**Why it exists.** A delete overtook its own create under `prefetch: 100` and resurrected a
+deleted product — the full story, including why the version guard is structurally unable to
+catch it, is under *Where the AI deviated from the spec* below.
 
 **Rejected: serialising everything.** It would also have fixed it, and would have made the
 already-bottlenecked consumer dramatically slower for no correctness gain.
@@ -384,7 +388,7 @@ as each settles.
 | A second bound-but-undrained queue | Built, then removed — it caused a real outage. See the deviations below. |
 | Schema evolution / zero-downtime reindex | The `products-read` alias exists to make it possible; the procedure is not implemented. |
 | Auth, multi-tenancy | Zero signal for the gates. |
-| Angular | Optio's frontend stack and the better signal, but I am faster in React by enough to matter against a nine-day clock. A conscious trade, not an oversight. |
+| Angular |I am faster in React by enough to matter against a nine-day clock. A conscious trade, not an oversight. |
 | TanStack Query from the start | Adopted late, after the UI already worked. The hand-rolled polling hook it replaced had a real race in the search screen. |
 | A regression test for the ordering bug's *integration* path | The serialiser has unit tests; the end-to-end behaviour is proven only by `make verify`. |
 
@@ -392,60 +396,89 @@ as each settles.
 
 ## Where the AI deviated from the spec
 
-`DEVLOG.md` has five entries written as they happened, including the unflattering ones. The
-two that matter most:
+`DEVLOG.md` has seven entries written as they happened, including the unflattering ones.
+Every one of them was found by running something — not one came from reading code, which is
+itself the finding. The three that matter most:
 
 ### The Elasticsearch index was never created with its mapping
 
-`ensureProductsIndex` was written in Phase 2, exported, and **never called by anything**. The
-first bulk write auto-created `products-v1` with Elasticsearch's default dynamic mapping:
-`price` as `float` instead of `scaled_float`, `sku` as text instead of `keyword`, no
-`products-read` alias, and `dynamic: strict` absent entirely.
+**Asked for.** SPEC §6 — index `products-v1` with an explicit mapping, `dynamic: strict`,
+because that is what gives G4 a real per-item failure mode.
 
-Every run for two phases — including 2,000,000-row runs I reported as successful — used the
-wrong index.
+**What was built.** `ensureProductsIndex` was written, exported, and **never called by
+anything**. The first bulk write auto-created the index with Elasticsearch's default dynamic
+mapping: `price` as `float` instead of `scaled_float`, `sku` as text instead of `keyword`, no
+`products-read` alias, `dynamic: strict` absent entirely. Every run for two phases — including
+2,000,000-row runs I reported as successful — used the wrong index.
 
-It survived because Phase 2's done-condition was "Elasticsearch doc count equals source
-count", which is true under either mapping. A passing count proves documents arrived, not that
-the index is correct. It surfaced only when G4's poison records were indexed cleanly instead
-of being rejected, and Elasticsearch *added* the unmapped field to the mapping — doing exactly
-what `dynamic: strict` exists to prevent. **G4 could not have passed.**
+**How it was caught.** Testing G4 for the first time. Three poison records carrying an unmapped
+field were indexed cleanly instead of being rejected, so I read the live mapping: `GET
+products-v1/_mapping` showed `simulated_unmapped_field` had been *added* to it. The index was
+doing the precise opposite of what `dynamic: strict` exists for. **G4 could not have passed.**
 
-Fixed by calling it from `OnModuleInit`, so the index cannot be written to before it exists
-correctly. The mapping cannot be changed in place, so the index had to be rebuilt from a clean
-volume.
+It survived two phases because Phase 2's done-condition was "Elasticsearch doc count equals
+source count", which is true under either mapping. A passing count proves documents arrived,
+not that the index is correct.
 
-The general lesson, which applies well beyond this bug: **a row count cannot verify a schema.**
+**Fix.** Two layers. `ensureProductsIndex` is called from `OnModuleInit`, so the sink cannot
+serve a write before the index exists correctly; and the cluster runs with
+`action.auto_create_index: "-products*,+*"`, so an index with the wrong mapping cannot come
+into existence by accident even if that call is ever skipped again. The mapping cannot be
+changed in place, so the index had to be rebuilt from a clean volume.
+
+**Lesson.** A row count cannot verify a schema.
 
 ### The demonstration queue blocked the pipeline it demonstrated
 
-SPEC §7 specified a second `analytics.queue`, bound but deliberately never drained, to show
-the fan-out was real. Under D6 that means a 2,000,000-row backfill parks 2,000,000 messages in
-it permanently.
+**Asked for.** SPEC §7 — a second `analytics.queue`, bound but deliberately never drained, to
+show the fan-out was real.
 
-Four consecutive `verify` runs passed in 326–371s. The fifth took 887s and failed three gates.
-The backfill had not stopped — it had slowed to 108 rows per second. RabbitMQ's log dated the
-window exactly: `system_memory_high_watermark` set at 11:57:08, cleared at 12:10:00, against a
-stall from 11:57:34 to 12:10:46. A memory alarm blocks publishing connections, so the
-backfill's own publishes stalled behind a drain event that could not arrive.
+**What was built.** Exactly that. Under D6 it means a 2,000,000-row backfill parks 2,000,000
+messages in a queue nobody will ever read, permanently, on top of whatever the consumer has
+not yet acked.
 
-Measured peaks: `analytics.queue` 2,001,000 held forever, against `product.consumer`'s 925,405
-that drains. Two thirds of the broker's load existed only to illustrate that a topic exchange
-fans out.
+**How it was caught.** The fifth consecutive verify run, and only the fifth. Runs one to four
+passed in 326–371s; run five took 887s and failed three gates. The backfill had not stopped —
+it had slowed to 108 rows per second. Correlating the worker's progress log against RabbitMQ's
+own put the stall inside a `system_memory_high_watermark` window to within thirty seconds. A
+memory alarm blocks publishing connections, so the backfill's own publishes stalled behind a
+drain event that could not arrive.
 
-Removed, and SPEC amended in its own commit (v3). This is the entry I would point at first,
-because it only appeared on the fifth run — two runs would have shipped it, and on a reviewer's
-machine with less memory it would have hit on the first.
+**Fix.** Removed, and SPEC amended in its own commit (v3). Measured peaks made the trade
+obvious: `analytics.queue` at 2,001,000 held forever against `product.consumer`'s 925,405 that
+drains — two thirds of the broker's load existed to illustrate that a topic exchange fans out.
 
-### The other three, briefly
+**Lesson.** Flaky is failing, and the reason to insist on five runs rather than two is that
+this one needed five. It is also the reason the capacity limit below is stated as observed
+rather than theoretical.
 
-- **`docker kill` does not trigger Docker's restart policy.** SPEC §9/G1 said "compose restarts
-  it." It does not — an explicit kill is treated as an intentional stop, verified with
-  `RestartCount: 0`. `verify.sh` performs the restart itself, and the spec was corrected.
-- **A deleted product came back to life.** ADR 4 above.
-- **`/metrics` is rendered by hand and `prom-client` was dropped.** Its registry is
-  per-process; the counters live in three containers and are aggregated through Postgres. A
-  histogram cannot be rebuilt from stored bucket counts, only from raw observations.
+### A deleted product came back to life
+
+**Asked for.** D4 and D6 — dedup on `processed_events`, and a projection upsert guarded by
+`WHERE excluded.version > product_projection.version`.
+
+**What was built.** Both, correctly. The guard works for what it was designed for.
+
+**How it was caught.** Counting, at the end of the first full run. 2,000,001 rows in the source
+against 2,000,002 in the projection. One row. Nothing in the logs was red, no batch had failed,
+every checkpoint was where it should be — the only symptom was one integer being larger than
+another. A product that `scripts/mutate.ts` created and soft-deleted moments apart had survived
+its own deletion.
+
+**Why the guard could not catch it.** I had conflated "the queue delivers in order" with "my
+handlers run in order". A single queue does deliver in order, but `prefetch: 100` means a
+hundred handlers are in flight at once and nothing was serialising them. `product.deleted` won
+the race against its own `product.created`: the DELETE matched zero rows because the row did
+not exist yet, and the INSERT then created it. The version guard needs an existing row to
+compare a version against, and after a delete there is none.
+
+**Fix.** `src/consumer/aggregate-serializer.ts` chains handlers per `aggregateId` — events for
+one product run in sequence, different products stay fully concurrent. Global serialisation
+would also have fixed it and was rejected: the consumer is already the bottleneck.
+
+**Lesson.** A guard protects against the failure you imagined. This one was designed for a
+stale update overwriting a fresh one, and says nothing about a delete arriving before the thing
+it deletes.
 
 ---
 

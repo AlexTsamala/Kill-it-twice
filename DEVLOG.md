@@ -177,8 +177,7 @@ the removal the backfill went straight through an alarm window at full speed —
 one. Five consecutive cold runs then passed in 326–389s, with G3 costing 5–7 attempts each
 time against its budget of 30.
 
-The peak itself is untouched, so a machine with substantially less than 8 GB could still
-stall. The fix is the one D6 already names — raise prefetch and batch-commit the projection,
+The peak itself is untouched, so a constrained Docker allocation could still stall. The fix is the one D6 already names — raise prefetch and batch-commit the projection,
 or run several consumers on the same queue — and it is not built. That belongs in the
 README's capacity notes, stated as a measured limit rather than as a solved problem.
 
@@ -289,3 +288,41 @@ rather than edited.
 
 **Verified after:** clean clone, `make up`, `make seed`, `make verify` — all five gates passed
 in 393s, then again in 371s with no cleanup between runs.
+
+---
+
+## 2026-09-23 — the memory ceiling fired on a machine that had enough memory
+
+**Asked for:** verify that adding `action.auto_create_index: "-products*,+*"` — a second layer
+against the 2026-09-21 mapping bug — had not broken anything.
+
+**What happened:** the run after that change took 2012s and failed four gates. `es 0` on G3,
+kill cycles never completed, counts 2,000,480 / 883,480 / 614,422 at the end.
+
+**How it was caught:** it announced itself — the run was five times slower than any before it.
+The question was whether the compose change had caused it, which the logs answered: the index
+had been created correctly with `dynamic: strict` and had accepted 1,820,800 documents, so
+auto-creation was not being blocked. RabbitMQ's log showed `system_memory_high_watermark` set
+and never cleared, and the worker's progress log showed the backfill at 262–612 rows/s against
+a normal 14,000.
+
+**Why it was wrong:** nothing was wrong with the change. This is the residual capacity limit
+recorded in the README after the `analytics.queue` removal — `product.consumer` peaking near
+925,000 messages — firing for the first time. `docker info` reports 7.7 GiB allocated to the
+Docker VM, shared across six containers plus Elasticsearch's 2 GB heap, and 3.6 GB of images
+and 4.1 GB of build cache had accumulated from a day of rebuilds and the clean-clone stack.
+RabbitMQ's watermark is 40% of what it sees as available. The host itself has 16 GiB; the
+constraint was the VM allocation, not the machine.
+
+After `docker system prune` and `docker builder prune`, the same code passed all five gates in
+311s — the fastest run recorded.
+
+**Resolution:** no code change, and deliberately none. Raising the watermark or shrinking the
+Elasticsearch heap would remove the symptom and leave the cause. The README's capacity section
+now states the limit as observed rather than predicted, with both numbers, because "a smaller
+machine might struggle" was too soft: a 7.7 GiB Docker VM on a 16 GiB host crossed it under
+nothing more than accumulated build cache.
+
+**Worth noting:** the pipeline was never incorrect. The checkpoint held, nothing was lost, and
+the counts converged once it recovered. What failed was the fifteen-minute budget, which is a
+capacity statement, not a correctness one.
